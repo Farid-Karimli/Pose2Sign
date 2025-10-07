@@ -1,7 +1,6 @@
 import imageio
 import numpy as np
 import math
-import csv
 import os
 import os.path
 import json
@@ -62,9 +61,6 @@ def load_rgb_frames_from_video2(video_path, target_frames=16, resize=(224, 224))
     vidcap = cv2.VideoCapture(video_path)
     frames = []
     total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Calculate the interval to sample frames evenly
-    frame_interval = max(1, total_frames // target_frames)
     
     frames_to_capture = set(np.round(np.linspace(0, total_frames - 1, target_frames)).astype(int))
     
@@ -153,7 +149,6 @@ class ASLCitizen(data_utl.Dataset):
 
         if not gloss_dict: #initialize gloss dict if not passed in as argument
             self.gloss_dict = {}
-            g_count = 0
         
             gloss_list = []
             video_df = pd.read_csv(video_file)
@@ -169,7 +164,6 @@ class ASLCitizen(data_utl.Dataset):
                 self.gloss_dict[g] = ind
         else:
             self.gloss_dict = gloss_dict
-            g_count = len(gloss_dict)
 
         print(f'Number of glossary items: {len(self.gloss_dict)}')
 
@@ -189,7 +183,6 @@ class ASLCitizen(data_utl.Dataset):
             signer_id = row['signer_id']
             filepath = os.path.join(datadir, os.path.basename(row['filepath']))
             class_name = row['class'].strip()
-            label = row['label']
 
             if class_name not in self.gloss_dict:
                 continue
@@ -217,7 +210,7 @@ class ASLCitizen(data_utl.Dataset):
 
     def __getitem__(self, index):
         video_path = self.video_paths[index]
-        l = self.labels[index]
+        label = self.labels[index]
 
         try:
             imgs = load_rgb_frames_from_video2(video_path, self.num_frames)
@@ -247,7 +240,7 @@ class ASLCitizen(data_utl.Dataset):
             # landmarks_by_frame = annotate_video(ret_img, draw_landmarks=False)
             # heatmaps = build_full_hand_heatmap(landmarks_by_frame)
 
-        return {"video": ret_img, "label": l, "pose_map": heatmaps}
+        return {"video": ret_img, "label": label, "pose_map": heatmaps}
 
     def __len__(self):
         return len(self.video_paths)
