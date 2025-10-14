@@ -1,3 +1,8 @@
 ASL_Citizen
-
+*.pyc
 *.zip
+
+Hyper-Motion/ckpts
+Hyper-Motion/samples
+
+VDM_EVFI

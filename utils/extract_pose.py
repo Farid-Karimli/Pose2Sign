@@ -91,15 +91,15 @@ def extract_pose_video(input_path, output_path, draw_on_blank=True, display_prog
 
 
 if __name__ == "__main__":
-    asl_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/videos"
+    asl_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/asl"
     asl_video_files = os.listdir(asl_video_path)
 
-    pose_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/pose_videos"
+    pose_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/1000_10030_videos"
     
     SUBSET = 1000
 
     if SUBSET:
-        asl_video_files = asl_video_files[:SUBSET]
+        asl_video_files = asl_video_files[SUBSET:SUBSET+30]
 
     for video_file in tqdm(asl_video_files, desc="Processing videos...", unit="video"):
         input_video = os.path.join(asl_video_path, video_file)
