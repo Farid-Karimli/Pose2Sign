@@ -78,12 +78,12 @@ sample_size         = [576, 1024] # horizontal screen 720P
 video_length        = 49
 fps                 = 16 # video_length / fps cannot be equal to 4.
 
-TRAINING_DATASET_PATH = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/1000_10030_videos"
+TRAINING_DATASET_PATH = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/validation"
 
 CONTROL_VIDEOS_PATH = os.path.join(TRAINING_DATASET_PATH, "pose")
 REF_FRAMES_PATH = os.path.join(TRAINING_DATASET_PATH, "ref_frames")
 
-VIDEO_FILE_NAME = "81602328051681-LICENSE"
+VIDEO_FILE_NAME = "1078294297946778-BLANKET"
 
 # Use torch.float16 if GPU does not support torch.bfloat16
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
