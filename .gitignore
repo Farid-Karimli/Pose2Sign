@@ -5,4 +5,8 @@ ASL_Citizen
 Hyper-Motion/ckpts
 Hyper-Motion/samples
 
-VDM_EVFI
+VDM_EVFI/scripts/test_set
+
+VDM_EVFI/**/*.mp4
+VDM_EVFI/**/*.gif
+VDM_EVFI/**/checkpoints*
