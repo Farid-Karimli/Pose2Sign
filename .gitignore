@@ -10,3 +10,14 @@ VDM_EVFI/scripts/test_set
 VDM_EVFI/**/*.mp4
 VDM_EVFI/**/*.gif
 VDM_EVFI/**/checkpoints*
+
+*.mp4
+*.json
+**/node_modules/
+*.pt 
+*.pth
+*.pkl
+*.onnx
+*.bin
+*.vsix
+latest
