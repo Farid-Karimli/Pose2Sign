@@ -21,3 +21,5 @@ VDM_EVFI/**/checkpoints*
 *.bin
 *.vsix
 latest
+
+**/zero_to_fp32.py

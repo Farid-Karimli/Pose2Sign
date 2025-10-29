@@ -141,6 +141,24 @@ def get_args():
     parser.add_argument('--freeze_image_encoder', action='store_true', default=True,
                         help='Freeze image encoder during training')
 
+    # Transformer freezing options
+    parser.add_argument('--freeze_patch_embedding', action='store_true',
+                        help='Freeze patch embedding layers in transformer')
+    parser.add_argument('--freeze_text_embedding', action='store_true',
+                        help='Freeze text embedding layers in transformer')
+    parser.add_argument('--freeze_time_embedding', action='store_true',
+                        help='Freeze time embedding layers in transformer')
+    parser.add_argument('--freeze_transformer_layers', type=str, default=None,
+                        help='Freeze specific transformer layers (e.g., "0-15" or "0,1,2,3")')
+    parser.add_argument('--freeze_self_attention', action='store_true',
+                        help='Freeze all self-attention layers')
+    parser.add_argument('--freeze_cross_attention', action='store_true',
+                        help='Freeze all cross-attention layers')
+    parser.add_argument('--freeze_ffn', action='store_true',
+                        help='Freeze all feed-forward networks')
+    parser.add_argument('--train_motion_scale_only', action='store_true',
+                        help='Only train motion_scale and space_scale_factor parameters')
+
     # Logging
     parser.add_argument('--log_every', type=int, default=10,
                         help='Log every N steps')
@@ -158,6 +176,129 @@ def set_seed(seed):
     np.random.seed(seed)
     import random
     random.seed(seed)
+
+
+def parse_layer_range(layer_str, num_layers):
+    """Parse layer range string into list of layer indices.
+
+    Args:
+        layer_str: String like "0-15" or "0,1,2,3" or None
+        num_layers: Total number of layers
+
+    Returns:
+        List of layer indices to freeze, or None if layer_str is None
+    """
+    if layer_str is None:
+        return None
+
+    layers = []
+    parts = layer_str.split(',')
+    for part in parts:
+        if '-' in part:
+            start, end = part.split('-')
+            layers.extend(range(int(start), int(end) + 1))
+        else:
+            layers.append(int(part))
+
+    # Validate layer indices
+    layers = [l for l in layers if 0 <= l < num_layers]
+    return layers
+
+
+def apply_transformer_freezing(transformer, args, logger):
+    """Apply selective freezing to transformer model.
+
+    Args:
+        transformer: WanTransformer3DModel instance
+        args: Training arguments with freezing options
+        logger: Logger for reporting
+    """
+    num_frozen = 0
+    num_trainable = 0
+
+    # First, unfreeze everything (in case model was frozen before)
+    for param in transformer.parameters():
+        param.requires_grad = True
+
+    # Freeze patch embedding
+    if args.freeze_patch_embedding:
+        transformer.patch_embedding.requires_grad_(False)
+        num_frozen += sum(p.numel() for p in transformer.patch_embedding.parameters())
+        logger.info("Frozen: patch_embedding")
+
+    # Freeze text embedding
+    if args.freeze_text_embedding:
+        transformer.text_embedding.requires_grad_(False)
+        num_frozen += sum(p.numel() for p in transformer.text_embedding.parameters())
+        logger.info("Frozen: text_embedding")
+
+    # Freeze time embedding
+    if args.freeze_time_embedding:
+        transformer.time_embedding.requires_grad_(False)
+        transformer.time_projection.requires_grad_(False)
+        num_frozen += sum(p.numel() for p in transformer.time_embedding.parameters())
+        num_frozen += sum(p.numel() for p in transformer.time_projection.parameters())
+        logger.info("Frozen: time_embedding and time_projection")
+
+    # Train only motion_scale parameters
+    if args.train_motion_scale_only:
+        # Freeze everything first
+        for param in transformer.parameters():
+            param.requires_grad = False
+
+        # Unfreeze only motion_scale and space_scale_factor
+        for name, module in transformer.named_modules():
+            if hasattr(module, 'motion_scale'):
+                module.motion_scale.requires_grad = True
+                logger.info(f"Trainable: {name}.motion_scale")
+            if hasattr(module, 'space_scale_factor'):
+                module.space_scale_factor.requires_grad = True
+                logger.info(f"Trainable: {name}.space_scale_factor")
+
+        num_trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+        num_frozen = sum(p.numel() for p in transformer.parameters() if not p.requires_grad)
+        logger.info(f"Training only motion_scale parameters: {num_trainable:,} trainable, {num_frozen:,} frozen")
+        return
+
+    # Parse layer range if specified
+    freeze_layers = parse_layer_range(args.freeze_transformer_layers, len(transformer.blocks))
+
+    # Freeze specific transformer blocks or components
+    for i, block in enumerate(transformer.blocks):
+        # Freeze entire block if specified
+        if freeze_layers is not None and i in freeze_layers:
+            block.requires_grad_(False)
+            num_frozen += sum(p.numel() for p in block.parameters())
+            logger.info(f"Frozen: block {i} (all components)")
+            continue
+
+        # Freeze specific components within blocks
+        if args.freeze_self_attention:
+            block.self_attn.requires_grad_(False)
+            num_frozen += sum(p.numel() for p in block.self_attn.parameters())
+            if i == 0:  # Log once
+                logger.info("Frozen: self_attn in all blocks")
+
+        if args.freeze_cross_attention:
+            block.cross_attn.requires_grad_(False)
+            num_frozen += sum(p.numel() for p in block.cross_attn.parameters())
+            if i == 0:  # Log once
+                logger.info("Frozen: cross_attn in all blocks")
+
+        if args.freeze_ffn:
+            block.ffn.requires_grad_(False)
+            num_frozen += sum(p.numel() for p in block.ffn.parameters())
+            if i == 0:  # Log once
+                logger.info("Frozen: ffn in all blocks")
+
+    # Count trainable parameters
+    num_trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in transformer.parameters())
+
+    logger.info(f"Transformer parameter summary:")
+    logger.info(f"  Total: {total_params:,} parameters")
+    logger.info(f"  Trainable: {num_trainable:,} parameters ({100 * num_trainable / total_params:.2f}%)")
+    logger.info(f"  Frozen: {total_params - num_trainable:,} parameters ({100 * (total_params - num_trainable) / total_params:.2f}%)")
 
 
 def compute_flow_matching_loss(model, vae, text_encoder, clip_image_encoder, tokenizer,
@@ -217,18 +358,24 @@ def compute_flow_matching_loss(model, vae, text_encoder, clip_image_encoder, tok
     with torch.no_grad():
         # Encode target video
         b, t, c, h, w = pixel_values.shape
-        pixel_values_reshaped = pixel_values.reshape(b * t, c, h, w)
+        # Rearrange to [b, c, t, h, w] for VAE encoding
+        pixel_values_reshaped = pixel_values.permute(0, 2, 1, 3, 4)
         latents = vae.encode(pixel_values_reshaped).latent_dist.sample()
-        latents = latents.reshape(b, t, *latents.shape[1:])
-        latents = latents * vae.config.scaling_factor
+        # latents shape: [b, latent_c, latent_t, latent_h, latent_w]
+        # Permute back to [b, latent_t, latent_c, latent_h, latent_w]
+        latents = latents.permute(0, 2, 1, 3, 4)
+        latents = latents * vae.spacial_compression_ratio
 
         # Encode control/guide video (pose)
-        guide_reshaped = guide_values.reshape(b * t, c, h, w)
+        guide_reshaped = guide_values.permute(0, 2, 1, 3, 4)
         control_latents = vae.encode(guide_reshaped).latent_dist.sample()
-        control_latents = control_latents.reshape(b, t, *control_latents.shape[1:])
+        control_latents = control_latents.permute(0, 2, 1, 3, 4)
 
         # Encode reference image for CLIP
-        clip_image_features = clip_image_encoder(reference_image)
+        # CLIP encoder expects a list of [C, 1, H, W] tensors
+        # reference_image is [B, C, H, W], so we convert each batch item to [C, 1, H, W]
+        clip_images_list = [img.unsqueeze(1) for img in reference_image]  # List of [C, 1, H, W]
+        clip_image_features = clip_image_encoder(clip_images_list)
 
     # Sample timesteps
     timesteps = torch.randint(
@@ -363,6 +510,11 @@ def main():
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
+    # Apply transformer freezing strategies
+    if rank == 0:
+        logger.info("Applying freezing strategies to transformer...")
+    apply_transformer_freezing(transformer, args, logger)
+
     # VAE
     vae = AutoencoderKLWan.from_pretrained(
         os.path.join(args.model_name, config['vae_kwargs'].get('vae_subpath', 'vae')),
@@ -411,9 +563,13 @@ def main():
     if world_size > 1:
         transformer = DDP(transformer, device_ids=[local_rank], output_device=local_rank)
 
-    # Setup optimizer
+    # Setup optimizer (only for trainable parameters)
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    if rank == 0:
+        logger.info(f"Optimizing {len(trainable_params)} parameter groups")
+
     optimizer = torch.optim.AdamW(
-        transformer.parameters(),
+        trainable_params,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),

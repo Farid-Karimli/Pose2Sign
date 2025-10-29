@@ -10,8 +10,6 @@ import torchvision.transforms as transforms
 from torch.utils.data.dataset import Dataset
 import cv2
 
-from copy import deepcopy
-from PIL import Image
 import torch.nn.functional as F
 
 

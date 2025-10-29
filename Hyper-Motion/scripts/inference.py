@@ -83,7 +83,7 @@ TRAINING_DATASET_PATH = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/val
 CONTROL_VIDEOS_PATH = os.path.join(TRAINING_DATASET_PATH, "pose")
 REF_FRAMES_PATH = os.path.join(TRAINING_DATASET_PATH, "ref_frames")
 
-VIDEO_FILE_NAME = "1078294297946778-BLANKET"
+VIDEO_FILE_NAME = "01581845388185399-GLASS 2"
 
 # Use torch.float16 if GPU does not support torch.bfloat16
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
@@ -105,7 +105,7 @@ negative_prompt     = "Twisted body, limb deformities"
 # negative_prompt         = "Twisted body, limb deformities, text captions, comic, static, ugly, error, messy code."
 guidance_scale          = 6.0
 seed                    = 43
-num_inference_steps     = 50
+num_inference_steps     = 25
 lora_weight             = 0.55
 save_path               = "samples/results"
 
@@ -129,7 +129,6 @@ if transformer_path is not None:
     state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
 
     m, u = transformer.load_state_dict(state_dict, strict=False)
-    print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
 
 # Get Vae
 vae = AutoencoderKLWan.from_pretrained(
@@ -147,7 +146,6 @@ if vae_path is not None:
     state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
 
     m, u = vae.load_state_dict(state_dict, strict=False)
-    print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
 
 # Get Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
