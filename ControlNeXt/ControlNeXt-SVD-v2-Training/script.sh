@@ -1,6 +1,3 @@
-
-
-
 accelerate  launch --config_file ./deepspeed.yaml train_svd.py \
  --pretrained_model_name_or_path=stabilityai/stable-video-diffusion-img2vid-xt-1-1 \
  --output_dir="./outputs" \

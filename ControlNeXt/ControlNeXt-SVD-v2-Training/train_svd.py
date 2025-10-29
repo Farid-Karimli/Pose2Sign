@@ -16,7 +16,6 @@
 
 """Script to fine-tune Stable Video Diffusion."""
 import argparse
-import random
 import logging
 import math
 import os
@@ -26,10 +25,9 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
-import accelerate
 import numpy as np
 import PIL
-from PIL import Image, ImageDraw
+from PIL import Image
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -38,7 +36,7 @@ import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from huggingface_hub import create_repo, upload_folder
+from huggingface_hub import create_repo
 from packaging import version
 from tqdm.auto import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
@@ -46,10 +44,7 @@ from einops import rearrange
 
 import datetime
 import diffusers
-from diffusers import StableVideoDiffusionPipeline
-from diffusers.models.lora import LoRALinearLayer
 from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler, UNetSpatioTemporalConditionModel
-from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, load_image
@@ -61,13 +56,24 @@ from models.unet_spatio_temporal_condition_controlnext import UNetSpatioTemporal
 from pipeline.pipeline_stable_video_diffusion_controlnext import StableVideoDiffusionPipelineControlNeXt
 from models.controlnext_vid_svd import ControlNeXtSDVModel
 import torch.nn as nn
-import pdb
 from diffusers.utils.torch_utils import randn_tensor
-from torch.utils.data import Dataset
 from safetensors.torch import load_file
 
 from ASL_dataset import ASLVideoDataset
 from moviepy import ImageSequenceClip
+
+# Import metrics functions
+from metrics import (
+    calculate_ssim,
+    calculate_psnr,
+    calculate_lpips,
+    calculate_mse,
+    calculate_fid_from_videos,
+    calculate_vfid,
+    LPIPS_AVAILABLE,
+    INCEPTION_AVAILABLE
+)
+import json
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0.dev0")
@@ -211,17 +217,20 @@ def load_images_from_folder(folder):
 
     return images
 
-def load_paired_validation_data(ref_frames_folder, pose_videos_folder, num=None):
+def load_paired_validation_data(ref_frames_folder, pose_videos_folder, gt_videos_folder=None, num=None):
       """
-      Load paired validation data where reference frames and pose videos have matching filenames.
+      Load paired validation data where reference frames, pose videos, and ground truth videos have matching filenames.
 
       Args:
           ref_frames_folder: Path to folder containing reference frame images (e.g., PNG files)
           pose_videos_folder: Path to folder containing pose videos (e.g., MP4 files)
+          gt_videos_folder: Path to folder containing ground truth ASL videos (e.g., MP4 files). Optional.
+          num: Number of pairs to load (None = load all)
 
       Returns:
-          List of tuples: [(ref_frame_pil, pose_frames_list), ...]
-          where ref_frame_pil is a PIL Image and pose_frames_list is a list of PIL Images
+          List of tuples: [(ref_frame_pil, pose_frames_list, gt_frames_list), ...]
+          where ref_frame_pil is a PIL Image, pose_frames_list is a list of PIL Images,
+          and gt_frames_list is a list of PIL Images (or None if gt_videos_folder not provided)
       """
       paired_data = []
 
@@ -243,16 +252,29 @@ def load_paired_validation_data(ref_frames_folder, pose_videos_folder, num=None)
           if ext.lower() in video_extensions:
               pose_files[basename] = filename
 
-      # Find matching pairs (basenames that exist in both folders)
+      # Get all files in gt_videos folder if provided
+      gt_files = {}
+      if gt_videos_folder is not None and os.path.exists(gt_videos_folder):
+          for filename in os.listdir(gt_videos_folder):
+              basename, ext = os.path.splitext(filename)
+              if ext.lower() in video_extensions:
+                  gt_files[basename] = filename
+
+      # Find matching pairs (basenames that exist in both ref and pose folders)
       common_basenames = sorted(set(ref_files.keys()) & set(pose_files.keys()))
 
+      # If GT folder provided, only keep basenames that also have GT videos
+      if gt_videos_folder is not None and gt_files:
+          common_basenames = sorted(set(common_basenames) & set(gt_files.keys()))
+          logger.info(f"Found {len(common_basenames)} matching validation triplets (ref + pose + GT)")
+      else:
+          logger.info(f"Found {len(common_basenames)} matching validation pairs (ref + pose, no GT)")
+
       if len(common_basenames) == 0:
-          logger.warning(f"No matching pairs found between {ref_frames_folder} and {pose_videos_folder}")
+          logger.warning(f"No matching pairs found")
           return paired_data
 
-      logger.info(f"Found {len(common_basenames)} matching validation pairs")
-
-      # Load each pair
+      # Load each pair/triplet
       for basename in common_basenames[:num]:
           # Load reference frame
           ref_path = os.path.join(ref_frames_folder, ref_files[basename])
@@ -270,13 +292,188 @@ def load_paired_validation_data(ref_frames_folder, pose_videos_folder, num=None)
               pose_frames.append(Image.fromarray(frame))
           cap.release()
 
+          # Load GT video frames if available
+          gt_frames = None
+          if gt_files and basename in gt_files:
+              gt_path = os.path.join(gt_videos_folder, gt_files[basename])
+              cap = cv2.VideoCapture(gt_path)
+              gt_frames = []
+              while True:
+                  ret, frame = cap.read()
+                  if not ret:
+                      break
+                  frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                  gt_frames.append(Image.fromarray(frame))
+              cap.release()
+
           if len(pose_frames) > 0:
-              paired_data.append((ref_frame, pose_frames))
-              logger.info(f"Loaded pair '{basename}': 1 ref frame + {len(pose_frames)} pose frames")
+              gt_info = f" + {len(gt_frames)} GT frames" if gt_frames else " (no GT)"
+              paired_data.append((ref_frame, pose_frames, gt_frames, basename))
+              logger.info(f"Loaded '{basename}': 1 ref frame + {len(pose_frames)} pose frames{gt_info}")
           else:
               logger.warning(f"Skipping '{basename}': pose video has no frames")
 
       return paired_data
+
+
+def compute_video_metrics(generated_frames, gt_frames, device='cuda'):
+    """
+    Compute all validation metrics between generated and ground truth frames.
+
+    Args:
+        generated_frames: list of PIL Images
+        gt_frames: list of PIL Images
+        device: device to run neural network models on
+
+    Returns:
+        dict with all computed metrics
+    """
+    # Convert PIL images to numpy arrays (H, W, C) in RGB, uint8 [0-255]
+    generated_np = [np.array(frame) for frame in generated_frames]
+    gt_np = [np.array(frame) for frame in gt_frames]
+
+    # Make sure they have the same number of frames
+    min_frames = min(len(generated_np), len(gt_np))
+    if len(generated_np) != len(gt_np):
+        logger.warning(f"Frame count mismatch: generated={len(generated_np)}, gt={len(gt_np)}. Using first {min_frames} frames.")
+        generated_np = generated_np[:min_frames]
+        gt_np = gt_np[:min_frames]
+
+    metrics = {}
+
+    # Frame-based metrics (always computed)
+    try:
+        metrics['ssim'] = float(calculate_ssim(generated_np, gt_np))
+    except Exception as e:
+        logger.warning(f"SSIM calculation failed: {e}")
+        metrics['ssim'] = None
+
+    try:
+        metrics['psnr'] = float(calculate_psnr(generated_np, gt_np))
+    except Exception as e:
+        logger.warning(f"PSNR calculation failed: {e}")
+        metrics['psnr'] = None
+
+    try:
+        mse_per_frame, mean_mse = calculate_mse(generated_np, gt_np)
+        metrics['mse'] = float(mean_mse)
+    except Exception as e:
+        logger.warning(f"MSE calculation failed: {e}")
+        metrics['mse'] = None
+
+    # Perceptual metric (requires lpips)
+    if LPIPS_AVAILABLE:
+        try:
+            metrics['lpips'] = float(calculate_lpips(generated_np, gt_np, device=device))
+        except Exception as e:
+            logger.warning(f"LPIPS calculation failed: {e}")
+            metrics['lpips'] = None
+    else:
+        metrics['lpips'] = None
+
+    # Distribution-based metrics (requires torchvision)
+    if INCEPTION_AVAILABLE:
+        try:
+            metrics['fid'] = float(calculate_fid_from_videos(generated_np, gt_np, device=device))
+        except Exception as e:
+            logger.warning(f"FID calculation failed: {e}")
+            metrics['fid'] = None
+
+        try:
+            metrics['vfid'] = float(calculate_vfid(generated_np, gt_np, device=device))
+        except Exception as e:
+            logger.warning(f"VFID calculation failed: {e}")
+            metrics['vfid'] = None
+    else:
+        metrics['fid'] = None
+        metrics['vfid'] = None
+
+    return metrics
+
+
+def save_metrics_report(all_video_metrics, save_dir, global_step):
+    """
+    Save a comprehensive metrics report as JSON and text.
+
+    Args:
+        all_video_metrics: list of dicts, each containing metrics for one video pair
+        save_dir: directory to save the report
+        global_step: current training step
+    """
+    # Calculate averages across all videos
+    metrics_summary = {
+        'global_step': global_step,
+        'num_videos': len(all_video_metrics),
+        'per_video_metrics': all_video_metrics,
+        'average_metrics': {}
+    }
+
+    # Compute averages for each metric
+    metric_names = ['ssim', 'psnr', 'mse', 'lpips', 'fid', 'vfid']
+    for metric_name in metric_names:
+        values = [v[metric_name] for v in all_video_metrics if v.get(metric_name) is not None]
+        if values:
+            metrics_summary['average_metrics'][metric_name] = float(np.mean(values))
+        else:
+            metrics_summary['average_metrics'][metric_name] = None
+
+    # Save JSON report
+    json_path = os.path.join(save_dir, f"metrics_step_{global_step}.json")
+    with open(json_path, 'w') as f:
+        json.dump(metrics_summary, f, indent=2)
+
+    # Save human-readable text report
+    txt_path = os.path.join(save_dir, f"metrics_step_{global_step}.txt")
+    with open(txt_path, 'w') as f:
+        f.write(f"=" * 80 + "\n")
+        f.write(f"VALIDATION METRICS REPORT - Step {global_step}\n")
+        f.write(f"=" * 80 + "\n\n")
+
+        f.write(f"Number of validation videos: {len(all_video_metrics)}\n\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("AVERAGE METRICS ACROSS ALL VIDEOS\n")
+        f.write("-" * 80 + "\n")
+
+        avg_metrics = metrics_summary['average_metrics']
+        if avg_metrics.get('ssim') is not None:
+            f.write(f"  SSIM:  {avg_metrics['ssim']:.4f}\n")
+        if avg_metrics.get('psnr') is not None:
+            f.write(f"  PSNR:  {avg_metrics['psnr']:.2f} dB\n")
+        if avg_metrics.get('mse') is not None:
+            f.write(f"  MSE:   {avg_metrics['mse']:.6f}\n")
+        if avg_metrics.get('lpips') is not None:
+            f.write(f"  LPIPS: {avg_metrics['lpips']:.4f}\n")
+        if avg_metrics.get('fid') is not None:
+            f.write(f"  FID:   {avg_metrics['fid']:.4f}\n")
+        if avg_metrics.get('vfid') is not None:
+            f.write(f"  VFID:  {avg_metrics['vfid']:.4f}\n")
+
+        f.write("\n" + "-" * 80 + "\n")
+        f.write("PER-VIDEO METRICS\n")
+        f.write("-" * 80 + "\n\n")
+
+        for i, video_metrics in enumerate(all_video_metrics):
+            f.write(f"Video {i}:\n")
+            if video_metrics.get('ssim') is not None:
+                f.write(f"  SSIM:  {video_metrics['ssim']:.4f}\n")
+            if video_metrics.get('psnr') is not None:
+                f.write(f"  PSNR:  {video_metrics['psnr']:.2f} dB\n")
+            if video_metrics.get('mse') is not None:
+                f.write(f"  MSE:   {video_metrics['mse']:.6f}\n")
+            if video_metrics.get('lpips') is not None:
+                f.write(f"  LPIPS: {video_metrics['lpips']:.4f}\n")
+            if video_metrics.get('fid') is not None:
+                f.write(f"  FID:   {video_metrics['fid']:.4f}\n")
+            if video_metrics.get('vfid') is not None:
+                f.write(f"  VFID:  {video_metrics['vfid']:.4f}\n")
+            f.write("\n")
+
+        f.write("=" * 80 + "\n")
+
+    logger.info(f"Saved metrics report to {json_path} and {txt_path}")
+
+    return metrics_summary
 
 
 # copy from https://github.com/crowsonkb/k-diffusion.git
@@ -1524,13 +1721,15 @@ def main():
                         pipeline = pipeline.to(accelerator.device)
                         pipeline.set_progress_bar_config(disable=True)
                         
+                        validation_base = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/validation"
                         validation_pairs = load_paired_validation_data(
-                                ref_frames_folder=os.path.join("/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/validation", "ref_frames"),
-                                pose_videos_folder=os.path.join("/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/validation", "pose"),
+                                ref_frames_folder=os.path.join(validation_base, "ref_frames"),
+                                pose_videos_folder=os.path.join(validation_base, "pose"),
+                                gt_videos_folder=os.path.join(validation_base, "asl"),
                                 num=args.num_validation_images
                             )
                         print(f"Loaded {len(validation_pairs)} paired validation samples")
-                        
+
                         # run inference
                         val_save_dir = os.path.join(
                             args.output_dir, "validation_images")
@@ -1538,10 +1737,13 @@ def main():
                         if not os.path.exists(val_save_dir):
                             os.makedirs(val_save_dir)
 
+                        # Store metrics for all videos
+                        all_video_metrics = []
+
                         with accelerator.autocast():
-                            for i, (val_ref_frame, val_control_frames) in enumerate(validation_pairs):
+                            for i, (val_ref_frame, val_control_frames, val_gt_frames, basename) in enumerate(validation_pairs):
                                 num_frames = len(val_control_frames)
-                                print(f"Generating video {i} with {num_frames} frames")                           
+                                logger.info(f"Generating video {i} ({basename}) with {num_frames} frames")
                                 video_frames = pipeline(
                                     val_ref_frame, # Starting reference image
                                     val_control_frames, # Conditioning control images (pose)
@@ -1553,8 +1755,8 @@ def main():
                                     motion_bucket_id=127.,
                                     fps=7,
                                     controlnext_cond_scale=1.0,
-                                    min_guidance_scale=3, 
-                                    max_guidance_scale=3, 
+                                    min_guidance_scale=3,
+                                    max_guidance_scale=3,
                                     noise_aug_strength=0.02,
                                     num_inference_steps=25,
                                     overlap=4,
@@ -1562,11 +1764,62 @@ def main():
                                 save_dir = os.path.join(val_save_dir, f"validation_{global_step}_vids")
                                 os.makedirs(save_dir, exist_ok=True)
                                 save_vid_side_by_side(
-                                    video_frames, 
+                                    video_frames,
                                     val_control_frames,
                                     save_dir,
                                     fps=7,
-                                    name=f"v{i}")        
+                                    name=f"v{i}_{basename}")
+
+                                # Compute metrics if ground truth is available
+                                if val_gt_frames is not None:
+                                    logger.info(f"Computing metrics for video {i} ({basename})")
+
+                                    # Flatten generated frames (video_frames is list of lists)
+                                    generated_frames_flat = [img for sublist in video_frames for img in sublist]
+
+                                    # Compute metrics
+                                    video_metrics = compute_video_metrics(
+                                        generated_frames_flat,
+                                        val_gt_frames,
+                                        device=accelerator.device
+                                    )
+                                    video_metrics['video_index'] = i
+                                    video_metrics['basename'] = basename
+                                    all_video_metrics.append(video_metrics)
+
+                                    # Log metrics for this video
+                                    logger.info(f"Video {i} metrics:")
+                                    if video_metrics.get('ssim') is not None:
+                                        logger.info(f"  SSIM: {video_metrics['ssim']:.4f}")
+                                    if video_metrics.get('psnr') is not None:
+                                        logger.info(f"  PSNR: {video_metrics['psnr']:.2f} dB")
+                                    if video_metrics.get('lpips') is not None:
+                                        logger.info(f"  LPIPS: {video_metrics['lpips']:.4f}")
+                                else:
+                                    logger.warning(f"No ground truth available for video {i} ({basename}), skipping metrics")
+
+                        # Save comprehensive metrics report
+                        if all_video_metrics:
+                            metrics_summary = save_metrics_report(all_video_metrics, save_dir, global_step)
+
+                            # Log average metrics to tensorboard/wandb
+                            avg_metrics = metrics_summary['average_metrics']
+                            log_dict = {f"val/{k}": v for k, v in avg_metrics.items() if v is not None}
+                            if log_dict:
+                                accelerator.log(log_dict, step=global_step)
+
+                            # Print summary to console
+                            logger.info("=" * 80)
+                            logger.info(f"VALIDATION SUMMARY - Step {global_step}")
+                            logger.info("=" * 80)
+                            logger.info(f"Evaluated {len(all_video_metrics)} videos")
+                            logger.info("Average metrics:")
+                            for metric_name, value in avg_metrics.items():
+                                if value is not None:
+                                    logger.info(f"  {metric_name.upper()}: {value:.4f}")
+                            logger.info("=" * 80)
+                        else:
+                            logger.warning("No ground truth videos available - metrics not computed")        
 
                         if args.use_ema:
                             # Switch back to the original UNet parameters.
