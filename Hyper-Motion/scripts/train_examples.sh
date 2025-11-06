@@ -62,21 +62,22 @@ python scripts/train.py \
 # ============================================================================
 # Train ONLY motion_scale and space_scale_factor parameters
 # This is the most parameter-efficient approach - only ~32-64 parameters!
-python scripts/train.py \
-  --data_folder $DATA_FOLDER \
-  --output_dir ${OUTPUT_DIR}/motion_scale_only \
+torchrun --nproc_per_node=2 scripts/train.py \
+  --data_folder "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/" \
+  --output_dir "./output/motion_scale_only" \
   --train_motion_scale_only \
   --batch_size 2 \
-  --gradient_accumulation_steps 2 \
+  --gradient_accumulation_steps 1 \
   --learning_rate 1e-4 \
-  --num_epochs 50
+  --num_epochs 50 \
+  --gradient_checkpointing
 
 # ============================================================================
 # Example 6: Freeze Embeddings, Train Transformer Blocks
 # ============================================================================
 # Keep input/text/time embeddings frozen, train transformer blocks
 python scripts/train.py \
-  --data_folder $DATA_FOLDER \
+  --data_folder "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/" \
   --output_dir ${OUTPUT_DIR}/freeze_embeddings \
   --freeze_patch_embedding \
   --freeze_text_embedding \
@@ -114,7 +115,7 @@ python scripts/train.py \
 torchrun --nproc_per_node=4 scripts/train.py \
   --data_folder $DATA_FOLDER \
   --output_dir ${OUTPUT_DIR}/multi_gpu_freeze \
-  --freeze_transformer_layers "0-15" \
+  --freeze_transformer_layers "0-30" \
   --batch_size 1 \
   --gradient_accumulation_steps 4 \
   --num_epochs 100

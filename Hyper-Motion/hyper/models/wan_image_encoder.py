@@ -548,6 +548,4 @@ class CLIPModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         state_dict = tmp_state_dict
         m, u = model.load_state_dict(state_dict)
         
-        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
-        print(m, u)
         return model

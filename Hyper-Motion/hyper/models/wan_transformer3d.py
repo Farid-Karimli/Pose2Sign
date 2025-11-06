@@ -327,8 +327,23 @@ def rope_apply_with_alllens(
     _, c = N, D // 2 #N, D/2
 
     # Parse scaling factors
-    scale_val = float(motion_scale) if motion_scale is not None else 0.0
-    space_fac = float(space_scale_factor) if space_scale_factor is not None else 0.02
+    # Keep as tensors to preserve gradients - don't convert to float!
+    if motion_scale is not None:
+        if isinstance(motion_scale, (int, float)):
+            scale_val = motion_scale
+        else:
+            scale_val = motion_scale.item() if motion_scale.numel() == 1 and not motion_scale.requires_grad else motion_scale
+    else:
+        scale_val = 0.0
+
+    if space_scale_factor is not None:
+        if isinstance(space_scale_factor, (int, float)):
+            space_fac = space_scale_factor
+        else:
+            space_fac = space_scale_factor.item() if space_scale_factor.numel() == 1 and not space_scale_factor.requires_grad else space_scale_factor
+    else:
+        space_fac = 0.02
+
     space_scaling = 1.0 + space_fac * scale_val       # e.g. 1.00 ~ 1.10
     # -----------------------------------
 
@@ -1241,14 +1256,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         state_dict = tmp_state_dict
 
         m, u = model.load_state_dict(state_dict, strict=False)
-        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
-        print(m)
         
         params = [p.numel() if "." in n else 0 for n, p in model.named_parameters()]
-        print(f"### All Parameters: {sum(params) / 1e6} M")
 
         params = [p.numel() if "attn1." in n else 0 for n, p in model.named_parameters()]
-        print(f"### attn1 Parameters: {sum(params) / 1e6} M")
         
         model = model.to(torch_dtype)
         return model

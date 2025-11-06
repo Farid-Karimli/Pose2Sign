@@ -29,6 +29,19 @@ from ASL_dataset import ASLVideoDataset
 from hyper.utils.utils import filter_kwargs
 
 
+class SimpleTextEncoder(torch.nn.Module):
+    """Simple learnable text embedding for memory-constrained training."""
+    def __init__(self, vocab_size=256384, embedding_dim=4096, max_length=512):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(vocab_size, embedding_dim)
+        self.max_length = max_length
+
+    def forward(self, input_ids, attention_mask=None):
+        """Returns embedded tokens."""
+        embeddings = self.embedding(input_ids)
+        return (embeddings,)  # Return tuple to match T5 encoder interface
+
+
 def setup_logging(output_dir, rank):
     """Setup logging configuration"""
     if rank == 0:
@@ -77,12 +90,16 @@ def get_args():
     # ASL Citizen Dataset params
     parser.add_argument('--data_folder', type=str, required=True,
                         help='Path to ASL Citizen dataset folder (contains /asl and /pose subdirectories)')
-    parser.add_argument('--sample_n_frames', type=int, default=49,
+    parser.add_argument('--validation_folder', type=str, default=None,
+                        help='Path to validation dataset folder. If not specified, no validation is performed.')
+    parser.add_argument('--sample_n_frames', type=int, default=14,
                         help='Number of frames to sample from each video')
-    parser.add_argument('--interval_frame', type=int, default=1,
+    parser.add_argument('--interval_frame', type=int, default=3,
                         help='Interval between sampled frames (1=consecutive, 2=every other)')
     parser.add_argument('--random_start', action='store_true',
                         help='Randomly sample start frame for each video clip')
+    parser.add_argument('--validate_every', type=int, default=1,
+                        help='Run validation every N epochs (default: 1, set to 0 to disable)')
 
     # Training params
     parser.add_argument('--output_dir', type=str, default='output/train',
@@ -106,11 +123,11 @@ def get_args():
                         help='Learning rate scheduler type')
 
     # Video params
-    parser.add_argument('--height', type=int, default=576,
+    parser.add_argument('--height', type=int, default=224,
                         help='Video height')
-    parser.add_argument('--width', type=int, default=1024,
+    parser.add_argument('--width', type=int, default=224,
                         help='Video width')
-    parser.add_argument('--fps', type=int, default=16,
+    parser.add_argument('--fps', type=int, default=7,
                         help='Target FPS for videos')
 
     # Model training params
@@ -140,6 +157,8 @@ def get_args():
                         help='Freeze text encoder during training')
     parser.add_argument('--freeze_image_encoder', action='store_true', default=True,
                         help='Freeze image encoder during training')
+    parser.add_argument('--use_simple_text_encoder', action='store_true',
+                        help='Use a simple learnable text embedding instead of full T5 encoder (saves memory)')
 
     # Transformer freezing options
     parser.add_argument('--freeze_patch_embedding', action='store_true',
@@ -339,43 +358,48 @@ def compute_flow_matching_loss(model, vae, text_encoder, clip_image_encoder, tok
         else:
             text_prompts.append(prompt)
 
-    # Encode text
+    # Encode text (text encoder is on CPU)
     text_inputs = tokenizer(
         text_prompts,
         padding="max_length",
         max_length=512,
         truncation=True,
         return_tensors="pt"
-    ).to(device)
+    ).to('cpu')  # Keep on CPU for text encoder
 
     with torch.no_grad():
         encoder_hidden_states = text_encoder(
             input_ids=text_inputs.input_ids,
             attention_mask=text_inputs.attention_mask
-        )
+        )[0]  # Unpack tuple - text encoder returns (x, )
+        # Move to GPU for transformer
+        encoder_hidden_states = encoder_hidden_states.to(device, dtype=weight_dtype)
 
-    # Encode videos to latent space using VAE
+    # Encode videos to latent space using VAE (VAE is on CPU)
     with torch.no_grad():
         # Encode target video
         b, t, c, h, w = pixel_values.shape
         # Rearrange to [b, c, t, h, w] for VAE encoding
-        pixel_values_reshaped = pixel_values.permute(0, 2, 1, 3, 4)
+        pixel_values_reshaped = pixel_values.permute(0, 2, 1, 3, 4).cpu().float()  # Move to CPU for VAE
         latents = vae.encode(pixel_values_reshaped).latent_dist.sample()
         # latents shape: [b, latent_c, latent_t, latent_h, latent_w]
         # Permute back to [b, latent_t, latent_c, latent_h, latent_w]
         latents = latents.permute(0, 2, 1, 3, 4)
         latents = latents * vae.spacial_compression_ratio
+        latents = latents.to(device, dtype=weight_dtype)  # Move back to GPU
 
         # Encode control/guide video (pose)
-        guide_reshaped = guide_values.permute(0, 2, 1, 3, 4)
+        guide_reshaped = guide_values.permute(0, 2, 1, 3, 4).cpu().float()  # Move to CPU for VAE
         control_latents = vae.encode(guide_reshaped).latent_dist.sample()
         control_latents = control_latents.permute(0, 2, 1, 3, 4)
+        control_latents = control_latents.to(device, dtype=weight_dtype)  # Move back to GPU
 
-        # Encode reference image for CLIP
+        # Encode reference image for CLIP (CLIP is on CPU)
         # CLIP encoder expects a list of [C, 1, H, W] tensors
         # reference_image is [B, C, H, W], so we convert each batch item to [C, 1, H, W]
-        clip_images_list = [img.unsqueeze(1) for img in reference_image]  # List of [C, 1, H, W]
+        clip_images_list = [img.unsqueeze(1).cpu().float() for img in reference_image]  # Move to CPU for CLIP
         clip_image_features = clip_image_encoder(clip_images_list)
+        clip_image_features = clip_image_features.to(device, dtype=weight_dtype)  # Move back to GPU
 
     # Sample timesteps
     timesteps = torch.randint(
@@ -398,14 +422,59 @@ def compute_flow_matching_loss(model, vae, text_encoder, clip_image_encoder, tok
     target = latents - noise
 
     # Predict the velocity using the model
+    # This is image-to-video (i2v) with pose control:
+    # - x (control_latents): pose conditioning video
+    # - y (noisy_latents): the video to denoise
+    # - clip_fea: CLIP features from reference image (for identity/appearance)
+    # - context: text embeddings (fixed generic prompt for all videos)
+
+    b, t, c, h, w = noisy_latents.shape
+
+    # Prepare control latents (pose) as input x - model expects [C, T, H, W] per sample
+    # Model expects 52 total channels: 16 (y/noisy) + 36 (x/control)
+    # We have 16 channels from control_latents, need to add 20 more
+    control_input = control_latents.permute(0, 2, 1, 3, 4)  # [B, 16, T, H, W]
+
+    # Add zero padding to reach 36 channels (52 - 16 from y)
+    # Or duplicate control latents to provide more conditioning signal
+    extra_control = torch.zeros(b, 20, t, h, w, device=control_input.device, dtype=control_input.dtype)
+    control_input = torch.cat([control_input, extra_control], dim=1)  # [B, 36, T, H, W]
+
+    control_input_list = [control_input[i] for i in range(b)]  # List of [36, T, H, W]
+
+    # Prepare noisy latents as y (conditional input in i2v mode)
+    noisy_input = noisy_latents.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+    noisy_input_list = [noisy_input[i] for i in range(b)]  # List of [C, T, H, W]
+
+    # Prepare text context
+    context_list = [encoder_hidden_states[i] for i in range(b)]  # List of [L, D]
+
+    # Add dtype attribute to list for model compatibility
+    class TensorList(list):
+        def __init__(self, items):
+            super().__init__(items)
+            self.dtype = items[0].dtype if len(items) > 0 else None
+
+    control_input_list = TensorList(control_input_list)
+    noisy_input_list = TensorList(noisy_input_list)
+
+    # Compute sequence length after patching (depends on patch size)
+    # With patch size (1, 2, 2), seq_len = T * (H/2) * (W/2)
+    seq_len = t * (h // 2) * (w // 2)
+
     model_pred = model(
-        noisy_latents,
-        timesteps,
-        encoder_hidden_states=encoder_hidden_states,
-        control_latents=control_latents,
-        clip_image_features=clip_image_features,
-        return_dict=False
-    )[0]
+        x=control_input_list,  # Pose control video
+        t=timesteps,
+        context=context_list,  # Text embeddings (fixed)
+        seq_len=seq_len,
+        clip_fea=clip_image_features,  # CLIP features from reference image
+        y=noisy_input_list,  # Noisy video to denoise (i2v mode)
+        cond_flag=True
+    )
+
+    # Convert model output back to [B, T, C, H, W] format
+    # model_pred is [B, C, T, H, W], target is [B, T, C, H, W]
+    model_pred = model_pred.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W]
 
     # Compute MSE loss
     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -467,6 +536,201 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, lr_scheduler=None):
     return checkpoint['epoch'], checkpoint['step']
 
 
+def validate(model, vae, text_encoder, clip_image_encoder, tokenizer, val_dataloader,
+             noise_scheduler, weight_dtype, device, prompt, rank, logger, epoch, output_dir,
+             num_samples=4):
+    """
+    Run validation on the validation dataset and generate sample videos.
+
+    Args:
+        num_samples: Number of sample videos to generate and save
+
+    Returns:
+        float: Average validation loss
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    if rank == 0:
+        logger.info("Running validation...")
+
+    # Store first batch for sample generation
+    first_batch = None
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(val_dataloader, desc="Validation", disable=rank != 0)):
+            # Save first batch for sample generation
+            if batch_idx == 0 and rank == 0:
+                first_batch = batch
+
+            # Compute loss using the same function as training
+            loss = compute_flow_matching_loss(
+                model,
+                vae,
+                text_encoder,
+                clip_image_encoder,
+                tokenizer,
+                batch,
+                noise_scheduler,
+                weight_dtype,
+                device,
+                prompt,
+                cfg_prob=0.0  # No CFG dropout during validation
+            )
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
+    # Synchronize across distributed processes
+    if torch.distributed.is_initialized():
+        avg_loss_tensor = torch.tensor(avg_loss, device=device)
+        torch.distributed.all_reduce(avg_loss_tensor, op=torch.distributed.ReduceOp.AVG)
+        avg_loss = avg_loss_tensor.item()
+
+    # Generate sample videos (only on rank 0)
+    if rank == 0 and first_batch is not None:
+        logger.info(f"Generating {num_samples} validation samples...")
+        try:
+            generate_validation_samples(
+                model, vae, text_encoder, clip_image_encoder, tokenizer,
+                first_batch, noise_scheduler, weight_dtype, device, prompt,
+                epoch, output_dir, num_samples, logger
+            )
+        except Exception as e:
+            logger.error(f"Error generating validation samples: {e}")
+
+    model.train()
+
+    if rank == 0:
+        logger.info(f"Validation loss: {avg_loss:.4f}")
+
+    return avg_loss
+
+
+def generate_validation_samples(model, vae, text_encoder, clip_image_encoder, tokenizer,
+                                 batch, noise_scheduler, weight_dtype, device, prompt,
+                                 epoch, output_dir, num_samples, logger):
+    """Generate and save validation video samples."""
+    import imageio
+    import numpy as np
+
+    # Create validation samples directory
+    samples_dir = os.path.join(output_dir, 'validation_samples')
+    os.makedirs(samples_dir, exist_ok=True)
+
+    # Limit to num_samples
+    batch_size = min(num_samples, batch["pixel_values"].shape[0])
+
+    # Extract batch data (only first num_samples)
+    pixel_values = batch["pixel_values"][:batch_size].to(device, dtype=weight_dtype)
+    guide_values = batch["guide_values"][:batch_size].to(device, dtype=weight_dtype)
+    reference_image = batch["reference_image"][:batch_size].to(device, dtype=weight_dtype)
+
+    # Encode inputs
+    with torch.no_grad():
+        # Encode text
+        text_prompts = [prompt] * batch_size
+        text_inputs = tokenizer(
+            text_prompts,
+            padding="max_length",
+            max_length=512,
+            truncation=True,
+            return_tensors="pt"
+        ).to('cpu')
+
+        encoder_hidden_states = text_encoder(
+            input_ids=text_inputs.input_ids,
+            attention_mask=text_inputs.attention_mask
+        )[0]
+        encoder_hidden_states = encoder_hidden_states.to(device, dtype=weight_dtype)
+
+        # Encode control video
+        b, t, c, h, w = guide_values.shape
+        guide_reshaped = guide_values.permute(0, 2, 1, 3, 4).cpu().float()
+        control_latents = vae.encode(guide_reshaped).latent_dist.sample()
+        control_latents = control_latents.permute(0, 2, 1, 3, 4).to(device, dtype=weight_dtype)
+
+        # Encode reference image for CLIP
+        clip_images_list = [img.unsqueeze(1).cpu().float() for img in reference_image]
+        clip_image_features = clip_image_encoder(clip_images_list).to(device, dtype=weight_dtype)
+
+        # Generate samples using the model (simplified inference)
+        # Start from random noise
+        latent_shape = (batch_size, t, 16, h // 8, w // 8)
+        latents = torch.randn(latent_shape, device=device, dtype=weight_dtype)
+
+        # Prepare inputs for model
+        control_input = control_latents.permute(0, 2, 1, 3, 4)
+        extra_control = torch.zeros(batch_size, 20, t, h // 8, w // 8,
+                                    device=control_input.device, dtype=control_input.dtype)
+        control_input = torch.cat([control_input, extra_control], dim=1)
+        control_input_list = [control_input[i] for i in range(batch_size)]
+
+        noisy_input = latents.permute(0, 2, 1, 3, 4)
+        noisy_input_list = [noisy_input[i] for i in range(batch_size)]
+
+        context_list = [encoder_hidden_states[i] for i in range(batch_size)]
+
+        # Add dtype attribute for compatibility
+        class TensorList(list):
+            def __init__(self, items):
+                super().__init__(items)
+                self.dtype = items[0].dtype if len(items) > 0 else None
+
+        control_input_list = TensorList(control_input_list)
+        noisy_input_list = TensorList(noisy_input_list)
+
+        # Single denoising step for visualization (full sampling would be too slow)
+        seq_len = t * (h // 8 // 2) * (w // 8 // 2)
+        timesteps = torch.tensor([500] * batch_size, device=device).long()
+
+        model_pred = model(
+            x=control_input_list,
+            t=timesteps,
+            context=context_list,
+            seq_len=seq_len,
+            clip_fea=clip_image_features,
+            y=noisy_input_list,
+            cond_flag=True
+        )
+
+        # Decode latents to videos
+        model_pred = model_pred.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W] -> [B, C, T, H, W]
+        model_pred = model_pred.cpu().float()
+        decoded_videos = vae.decode(model_pred).sample
+
+        # Convert to numpy and save
+        decoded_videos = decoded_videos.permute(0, 2, 3, 4, 1)  # [B, C, T, H, W] -> [B, T, H, W, C]
+        decoded_videos = ((decoded_videos + 1.0) / 2.0).clamp(0, 1)  # [-1, 1] -> [0, 1]
+        decoded_videos = (decoded_videos.cpu().numpy() * 255).astype(np.uint8)
+
+        # Also save ground truth and control
+        gt_videos = ((pixel_values.cpu() + 1.0) / 2.0).clamp(0, 1)
+        gt_videos = (gt_videos.permute(0, 1, 3, 4, 2).numpy() * 255).astype(np.uint8)
+
+        control_videos = ((guide_values.cpu() + 1.0) / 2.0).clamp(0, 1)
+        control_videos = (control_videos.permute(0, 1, 3, 4, 2).numpy() * 255).astype(np.uint8)
+
+        # Save videos
+        for i in range(batch_size):
+            # Save generated video
+            video_path = os.path.join(samples_dir, f'epoch{epoch:04d}_sample{i:02d}_generated.mp4')
+            imageio.mimsave(video_path, decoded_videos[i], fps=7, codec='libx264')
+
+            # Save ground truth
+            gt_path = os.path.join(samples_dir, f'epoch{epoch:04d}_sample{i:02d}_groundtruth.mp4')
+            imageio.mimsave(gt_path, gt_videos[i], fps=7, codec='libx264')
+
+            # Save control (pose)
+            control_path = os.path.join(samples_dir, f'epoch{epoch:04d}_sample{i:02d}_control.mp4')
+            imageio.mimsave(control_path, control_videos[i], fps=7, codec='libx264')
+
+        logger.info(f"Saved {batch_size} validation samples to {samples_dir}")
+
+
 def main():
     args = get_args()
 
@@ -515,11 +779,13 @@ def main():
         logger.info("Applying freezing strategies to transformer...")
     apply_transformer_freezing(transformer, args, logger)
 
-    # VAE
+    # VAE - Keep on CPU to save GPU memory (will be used with torch.no_grad())
+    if rank == 0:
+        logger.info("Loading VAE on CPU to save GPU memory...")
     vae = AutoencoderKLWan.from_pretrained(
         os.path.join(args.model_name, config['vae_kwargs'].get('vae_subpath', 'vae')),
         additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
-    ).to(device, dtype=weight_dtype)
+    ).to('cpu', dtype=torch.float32)  # Keep on CPU in float32
 
     if args.freeze_vae:
         vae.requires_grad_(False)
@@ -530,22 +796,26 @@ def main():
         os.path.join(args.model_name, config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
     )
 
-    # Text encoder
+    # Text encoder - Keep on CPU to save GPU memory
+    if rank == 0:
+        logger.info("Loading Text Encoder on CPU to save GPU memory...")
     text_encoder = WanT5EncoderModel.from_pretrained(
         os.path.join(args.model_name, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
         additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
         low_cpu_mem_usage=True,
-        torch_dtype=weight_dtype,
-    ).to(device)
+        torch_dtype=torch.float32,
+    ).to('cpu')  # Keep on CPU
 
     if args.freeze_text_encoder:
         text_encoder.requires_grad_(False)
         text_encoder.eval()
 
-    # CLIP Image Encoder
+    # CLIP Image Encoder - Keep on CPU to save GPU memory
+    if rank == 0:
+        logger.info("Loading CLIP on CPU to save GPU memory...")
     clip_image_encoder = CLIPModel.from_pretrained(
         os.path.join(args.model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-    ).to(device, dtype=weight_dtype)
+    ).to('cpu', dtype=torch.float32)  # Keep on CPU
 
     if args.freeze_image_encoder:
         clip_image_encoder.requires_grad_(False)
@@ -566,7 +836,18 @@ def main():
     # Setup optimizer (only for trainable parameters)
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
     if rank == 0:
+        num_trainable = sum(p.numel() for p in trainable_params)
+        num_total = sum(p.numel() for p in transformer.parameters())
         logger.info(f"Optimizing {len(trainable_params)} parameter groups")
+        logger.info(f"Trainable parameters: {num_trainable:,} / {num_total:,} ({100 * num_trainable / num_total:.2f}%)")
+
+        # Critical check: ensure we have trainable parameters
+        if num_trainable == 0:
+            raise RuntimeError(
+                "No trainable parameters found in the model! "
+                "Please check your freezing configuration. "
+                "At least one parameter must be trainable for training to work."
+            )
 
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -576,9 +857,9 @@ def main():
         eps=1e-8
     )
 
-    # Setup ASL Citizen dataset
+    # Setup ASL Citizen training dataset
     if rank == 0:
-        logger.info(f"Loading ASL Citizen dataset from {args.data_folder}")
+        logger.info(f"Loading ASL Citizen training dataset from {args.data_folder}")
 
     train_dataset = ASLVideoDataset(
         data_folder_path=args.data_folder,
@@ -591,9 +872,9 @@ def main():
     )
 
     if rank == 0:
-        logger.info(f"Dataset loaded: {len(train_dataset)} video pairs")
+        logger.info(f"Training dataset loaded: {len(train_dataset)} video pairs")
 
-    # Setup dataloader
+    # Setup training dataloader
     if world_size > 1:
         sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     else:
@@ -608,6 +889,37 @@ def main():
         pin_memory=True,
         drop_last=True
     )
+
+    # Setup validation dataset (if provided)
+    val_dataloader = None
+    if args.validation_folder is not None and args.validate_every > 0:
+        if rank == 0:
+            logger.info(f"Loading ASL Citizen validation dataset from {args.validation_folder}")
+
+        val_dataset = ASLVideoDataset(
+            data_folder_path=args.validation_folder,
+            sample_n_frames=args.sample_n_frames,
+            interval_frame=args.interval_frame,
+            width=args.width,
+            height=args.height,
+            normalize_to_neg1_1=True,
+            random_start=False,  # No random start for validation (consistent evaluation)
+        )
+
+        if rank == 0:
+            logger.info(f"Validation dataset loaded: {len(val_dataset)} video pairs")
+
+        # Setup validation dataloader (no distributed sampler for validation)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,  # Don't shuffle validation data
+            num_workers=4,
+            pin_memory=True,
+            drop_last=False
+        )
+    elif rank == 0:
+        logger.info("No validation dataset specified or validation disabled")
 
     # Calculate total training steps
     num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
@@ -634,6 +946,10 @@ def main():
     # Setup gradient scaler for mixed precision
     scaler = GradScaler() if args.mixed_precision == 'fp16' else None
 
+    # Best model tracking
+    best_val_loss = float('inf')
+    best_model_path = None
+
     # Training loop
     if rank == 0:
         logger.info("***** Running training *****")
@@ -643,6 +959,8 @@ def main():
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_train_steps}")
         logger.info(f"  Text prompt: {args.prompt}")
+        if val_dataloader is not None:
+            logger.info(f"  Validation every {args.validate_every} epoch(s)")
 
     for epoch in range(start_epoch, args.num_epochs):
         if world_size > 1:
@@ -719,7 +1037,53 @@ def main():
         # End of epoch
         avg_epoch_loss = epoch_loss / len(train_dataloader)
         if rank == 0:
-            logger.info(f"Epoch {epoch} completed. Average loss: {avg_epoch_loss:.4f}")
+            logger.info(f"Epoch {epoch} completed. Average training loss: {avg_epoch_loss:.4f}")
+
+        # Run validation if enabled
+        if val_dataloader is not None and (epoch + 1) % args.validate_every == 0:
+            val_loss = validate(
+                transformer.module if isinstance(transformer, DDP) else transformer,
+                vae,
+                text_encoder,
+                clip_image_encoder,
+                tokenizer,
+                val_dataloader,
+                noise_scheduler,
+                weight_dtype,
+                device,
+                args.prompt,
+                rank,
+                logger,
+                epoch,
+                args.output_dir,
+                num_samples=4
+            )
+
+            # Save best model
+            if rank == 0 and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                logger.info(f"New best validation loss: {best_val_loss:.4f}")
+
+                # Save best model
+                best_model_dir = os.path.join(args.output_dir, 'best_model')
+                os.makedirs(best_model_dir, exist_ok=True)
+
+                if isinstance(transformer, DDP):
+                    model_state = transformer.module.state_dict()
+                else:
+                    model_state = transformer.state_dict()
+
+                torch.save({
+                    'epoch': epoch,
+                    'step': global_step,
+                    'model_state_dict': model_state,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                    'val_loss': best_val_loss,
+                }, os.path.join(best_model_dir, 'best_model.pt'))
+
+                logger.info(f"Saved best model to {best_model_dir}")
+                best_model_path = best_model_dir
 
         # Save checkpoint at end of epoch
         save_checkpoint(transformer, optimizer, lr_scheduler, epoch + 1, global_step,
@@ -727,6 +1091,8 @@ def main():
 
     if rank == 0:
         logger.info("Training completed!")
+        if best_model_path is not None:
+            logger.info(f"Best model saved at: {best_model_path} (val_loss: {best_val_loss:.4f})")
 
     # Cleanup
     if world_size > 1:

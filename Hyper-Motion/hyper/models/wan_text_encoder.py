@@ -371,6 +371,4 @@ class WanT5EncoderModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         else:
             state_dict = torch.load(pretrained_model_path, map_location="cpu")
         m, u = model.load_state_dict(state_dict, strict=False)
-        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
-        print(m, u)
         return model
