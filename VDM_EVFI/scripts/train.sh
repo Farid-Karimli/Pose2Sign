@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES=1 accelerate  launch --num_processes 1 train.py \
     --pretrained_model_name_or_path="stabilityai/stable-video-diffusion-img2vid" \
     --output_dir="checkpoints" \
-    --per_gpu_batch_size=1 --gradient_accumulation_steps=16 \
+    --per_gpu_batch_size=1 --gradient_accumulation_steps=4 \
     --num_train_epochs=50 \
     --checkpointing_steps=50 --checkpoints_total_limit=10 \
     --learning_rate=5e-5 --lr_warmup_steps=0 \

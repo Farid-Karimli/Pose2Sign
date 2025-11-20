@@ -845,7 +845,7 @@ def main():
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetSDVModel.from_pretrained(args.controlnet_model_name_or_path, subfolder="controlnet",)
+        ControlNetSDVModel.from_pretrained(args.controlnet_model_name_or_path, subfolder="controlnet")
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetSDVModel.from_unet(unet)
@@ -1164,7 +1164,7 @@ def main():
                         disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-
+    # And we train!
     for epoch in range(first_epoch, args.num_train_epochs):
         controlnet.train()
         train_loss = 0.0
@@ -1176,13 +1176,15 @@ def main():
                 continue
 
             with accelerator.accumulate(controlnet):
-                # first, convert images to latent space.
+                
+                # pixel_values is the first frame
                 pixel_values = batch["pixel_values"].to(weight_dtype).to(
                     accelerator.device, non_blocking=True
                 )
                 #breakpoint()
                 conditional_pixel_values = pixel_values[:, 0:1, :, :, :]
 
+                # First, convert the first frame to latents
                 latents = tensor_to_vae_latent(pixel_values, vae)
 
                 # Sample noise that we'll add to the latents
@@ -1252,15 +1254,14 @@ def main():
                 inp_noisy_latents = torch.cat(
                     [inp_noisy_latents, conditional_latents], dim=2)
 
-                # check https://arxiv.org/abs/2206.00364(the EDM-framework) for more details.
+                # check https://arxiv.org/abs/2206.00364 (the EDM-framework) for more details.
                 target = latents
-                controlnet_image= batch["guide_values"].to(weight_dtype).to(
+                controlnet_image = batch["guide_values"].to(weight_dtype).to(
                     accelerator.device, non_blocking=True
                 )
+                print(f"Controlnet_image shape: {controlnet_image.shape}")
 
-
-        
-                down_block_res_samples, mid_block_res_sample= controlnet(
+                down_block_res_samples, mid_block_res_sample = controlnet(
                     inp_noisy_latents, timesteps, encoder_hidden_states,
                     added_time_ids=added_time_ids,
                     controlnet_cond=controlnet_image,

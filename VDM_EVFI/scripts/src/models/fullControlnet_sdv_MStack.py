@@ -264,7 +264,7 @@ class ControlNetSDVModel(ModelMixin, ConfigMixin, FromOriginalControlNetMixin):
         self.controlnet_cond_embedding = ControlNetConditioningEmbeddingSVD(
             conditioning_embedding_channels=block_out_channels[0],
             block_out_channels=conditioning_embedding_out_channels,
-            conditioning_channels= 3#EV_CHANNELS,
+            conditioning_channels= 6 #EV_CHANNELS,
         )
 
         # self.controlnet_cond_embedding = ConcentrationNet(10, 32, attention_method='soft')

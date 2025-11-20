@@ -896,10 +896,10 @@ def main():
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetSDVModel.from_pretrained(args.controlnet_model_name_or_path)
+        controlnet = ControlNetSDVModel.from_pretrained(args.controlnet_model_name_or_path, ignore_mismatched_sizes=True)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetSDVModel.from_unet(unet)
+        controlnet = ControlNetSDVModel.from_unet(unet, ignore_mismatched_sizes=True)
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -1162,7 +1162,7 @@ def main():
                     t0= args.t0,
                     M= args.M,
                     s_churn= args.s_churn,
-                    org_frames= org_frames
+                    org_frames= org_frames,
                 )
 
                 video_frames= video_frames.frames[0]

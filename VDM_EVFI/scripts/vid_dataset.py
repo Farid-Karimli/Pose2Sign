@@ -405,8 +405,9 @@ class ASLVideoDataset(Dataset):
                guide_values: [B, T, C, H, W]
                reference_image: [B, C, H, W]
         """
-        if isinstance(idx_or_indices, (list, tuple, np.ndarray)):
-            samples = [self._load_single(int(i)) for i in idx_or_indices]
+        if isinstance(idx_or_indices, slice):
+            rng = range(idx_or_indices.start or 0, idx_or_indices.stop or 0, idx_or_indices.step or 1)
+            samples = [self._load_single(int(i)) for i in rng]
             px = torch.stack([s[0] for s in samples], dim=0)   # [B,T,C,H,W]
             gv = torch.stack([s[1] for s in samples], dim=0)   # [B,T,C,H,W]
             ri = torch.stack([s[2] for s in samples], dim=0)   # [B,C,H,W]
@@ -414,13 +415,14 @@ class ASLVideoDataset(Dataset):
         else:
             return self._load_single(int(idx_or_indices))
 
-    def __getitem__(self, idx):
-        px, gv, ri = self.get_batch(int(idx))
+    def __getitem__(self, idx):        
+        px, gv, ri = self.get_batch(idx)
         return {
             "pixel_values": px,           # [T, C, H, W]
             "guide_values": gv,           # [T, C, H, W]
             "reference_image": ri         # [C, H, W]
         }
+
 
 
 """
