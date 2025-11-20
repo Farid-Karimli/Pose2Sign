@@ -1,0 +1,8 @@
+2025-11-04 15:06:13,138 - INFO - Starting training with config: Namespace(config_path='config/wan2.1/wan_civitai.yaml', model_name='./ckpts', data_folder='/path/to/asl_data', sample_n_frames=49, interval_frame=1, random_start=False, output_dir='output/train', batch_size=1, gradient_accumulation_steps=4, num_epochs=100, learning_rate=1e-05, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=500, lr_scheduler='cosine', height=576, width=1024, fps=16, mixed_precision='bf16', prompt='A person signing a word in American Sign Language. High quality, masterpiece, best quality, high resolution.', cfg_prob=0.1, checkpoint_every=1000, resume_from_checkpoint=None, keep_checkpoints=5, gradient_checkpointing=False, freeze_vae=True, freeze_text_encoder=True, freeze_image_encoder=True, freeze_patch_embedding=False, freeze_text_embedding=False, freeze_time_embedding=False, freeze_transformer_layers=None, freeze_self_attention=False, freeze_cross_attention=False, freeze_ffn=False, train_motion_scale_only=False, log_every=10, seed=42)
+2025-11-04 15:06:13,138 - INFO - World size: 2, Rank: 0
+2025-11-04 15:06:13,144 - INFO - Loading models...
+2025-11-04 15:06:13,424 - INFO - Applying freezing strategies to transformer...
+2025-11-04 15:06:13,429 - INFO - Transformer parameter summary:
+2025-11-04 15:06:13,429 - INFO -   Total: 16,395,206,624 parameters
+2025-11-04 15:06:13,430 - INFO -   Trainable: 16,395,206,624 parameters (100.00%)
+2025-11-04 15:06:13,430 - INFO -   Frozen: 0 parameters (0.00%)

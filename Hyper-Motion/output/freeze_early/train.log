@@ -1,0 +1,34 @@
+2025-11-04 14:53:06,388 - INFO - Starting training with config: Namespace(config_path='config/wan2.1/wan_civitai.yaml', model_name='./ckpts', data_folder='/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/', sample_n_frames=49, interval_frame=1, random_start=False, output_dir='./output/freeze_early', batch_size=1, gradient_accumulation_steps=4, num_epochs=100, learning_rate=1e-05, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=500, lr_scheduler='cosine', height=576, width=1024, fps=16, mixed_precision='bf16', prompt='A person signing a word in American Sign Language. High quality, masterpiece, best quality, high resolution.', cfg_prob=0.1, checkpoint_every=1000, resume_from_checkpoint=None, keep_checkpoints=5, gradient_checkpointing=False, freeze_vae=True, freeze_text_encoder=True, freeze_image_encoder=True, freeze_patch_embedding=False, freeze_text_embedding=False, freeze_time_embedding=False, freeze_transformer_layers='0-15', freeze_self_attention=False, freeze_cross_attention=False, freeze_ffn=False, train_motion_scale_only=False, log_every=10, seed=42)
+2025-11-04 14:53:06,388 - INFO - World size: 1, Rank: 0
+2025-11-04 14:53:06,453 - INFO - Loading models...
+2025-11-04 14:53:15,090 - INFO - Applying freezing strategies to transformer...
+2025-11-04 14:53:15,092 - INFO - Frozen: block 0 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 1 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 2 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 3 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 4 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 5 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 6 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 7 (all components)
+2025-11-04 14:53:15,093 - INFO - Frozen: block 8 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 9 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 10 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 11 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 12 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 13 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 14 (all components)
+2025-11-04 14:53:15,094 - INFO - Frozen: block 15 (all components)
+2025-11-04 14:53:15,098 - INFO - Transformer parameter summary:
+2025-11-04 14:53:15,098 - INFO -   Total: 16,395,206,624 parameters
+2025-11-04 14:53:15,098 - INFO -   Trainable: 9,933,791,136 parameters (60.59%)
+2025-11-04 14:53:15,098 - INFO -   Frozen: 6,461,415,488 parameters (39.41%)
+2025-11-04 14:55:32,326 - INFO - Optimizing 887 parameter groups
+2025-11-04 14:55:32,327 - INFO - Loading ASL Citizen dataset from /restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/
+2025-11-04 14:55:32,481 - INFO - Dataset loaded: 880 video pairs
+2025-11-04 14:55:32,481 - INFO - ***** Running training *****
+2025-11-04 14:55:32,481 - INFO -   Num examples = 880
+2025-11-04 14:55:32,481 - INFO -   Num Epochs = 100
+2025-11-04 14:55:32,481 - INFO -   Batch size per device = 1
+2025-11-04 14:55:32,482 - INFO -   Gradient Accumulation steps = 4
+2025-11-04 14:55:32,482 - INFO -   Total optimization steps = 22000
+2025-11-04 14:55:32,482 - INFO -   Text prompt: A person signing a word in American Sign Language. High quality, masterpiece, best quality, high resolution.
