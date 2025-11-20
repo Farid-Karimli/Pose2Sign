@@ -1,5 +1,3 @@
-
-
 import argparse
 import torch
 import os
@@ -9,7 +7,7 @@ from collections import OrderedDict
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("checkpoint_dir",
+    parser.add_argument("--checkpoint_dir",
                         type=str,
                         help="path to the desired checkpoint folder, e.g., path/checkpoint-12")
     args = parser.parse_args()
