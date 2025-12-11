@@ -31,7 +31,6 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import RandomSampler
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
@@ -73,6 +72,10 @@ from metrics import (
     LPIPS_AVAILABLE,
     INCEPTION_AVAILABLE
 )
+
+# Import pose faithfulness metrics
+from pose_metrics import PoseExtractor
+
 import json
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -391,6 +394,152 @@ def compute_video_metrics(generated_frames, gt_frames, device='cuda'):
     return metrics
 
 
+def compute_pose_faithfulness_metrics(pose_frames, generated_frames, body_pck_threshold=0.15,
+                                       hands_pck_threshold=0.05, face_pck_threshold=0.05, verbose=False):
+    """
+    Compute pose faithfulness metrics between pose conditioning frames and generated frames.
+
+    Args:
+        pose_frames: list of PIL Images (pose conditioning)
+        generated_frames: list of PIL Images (generated output)
+        body_pck_threshold: threshold for body PCK metric (default 0.15 for normalized coordinates)
+        hands_pck_threshold: threshold for hands PCK metric (default 0.05 for normalized coordinates)
+        face_pck_threshold: threshold for face PCK metric (default 0.05 for normalized coordinates)
+        verbose: print detailed progress
+
+    Returns:
+        dict with pose faithfulness metrics
+    """
+    try:
+        # Initialize pose extractor
+        extractor = PoseExtractor()
+
+        # Extract keypoints from both videos
+        pose_kps = []
+        gen_kps = []
+
+        for pose_frame, gen_frame in zip(pose_frames, generated_frames):
+            # Convert PIL to numpy
+            pose_np = np.array(pose_frame)
+            gen_np = np.array(gen_frame)
+
+            # Extract keypoints
+            pose_kp = extractor.extract_from_frame(pose_np)
+            gen_kp = extractor.extract_from_frame(gen_np)
+
+            pose_kps.append(pose_kp)
+            gen_kps.append(gen_kp)
+
+        extractor.close()
+
+        # Calculate frame-wise metrics
+        from pose_metrics import (
+            calculate_mpjpe,
+            calculate_procrustes_mpjpe,
+            calculate_pck,
+            calculate_temporal_smoothness,
+            align_hand_keypoints
+        )
+
+        body_mpjpe_list = []
+        body_pmpjpe_list = []  # Procrustes-MPJPE
+        body_pck_list = []
+        hands_mpjpe_list = []
+        hands_pmpjpe_list = []
+        hands_pck_list = []
+        face_mpjpe_list = []
+        face_pmpjpe_list = []
+        face_pck_list = []
+
+        for pose_kp, gen_kp in zip(pose_kps, gen_kps):
+            # Body metrics (use GT visibility from pose_kp)
+            if pose_kp['body'] is not None and gen_kp['body'] is not None:
+                body_mpjpe_list.append(calculate_mpjpe(pose_kp['body'], gen_kp['body']))
+                body_pmpjpe_list.append(calculate_procrustes_mpjpe(pose_kp['body'], gen_kp['body']))
+                body_pck_list.append(calculate_pck(pose_kp['body'], gen_kp['body'], body_pck_threshold))
+
+            # Hand metrics
+            pose_hands, gen_hands = align_hand_keypoints(pose_kp['hands'], gen_kp['hands'])
+            if pose_hands is not None and gen_hands is not None:
+                hands_mpjpe_list.append(calculate_mpjpe(pose_hands, gen_hands, use_visibility=False))
+                hands_pmpjpe_list.append(calculate_procrustes_mpjpe(pose_hands, gen_hands, use_visibility=False))
+                hands_pck_list.append(calculate_pck(pose_hands, gen_hands, hands_pck_threshold, use_visibility=False))
+
+            # Face metrics
+            if pose_kp['face'] is not None and gen_kp['face'] is not None:
+                face_mpjpe_list.append(calculate_mpjpe(pose_kp['face'], gen_kp['face'], use_visibility=False))
+                face_pmpjpe_list.append(calculate_procrustes_mpjpe(pose_kp['face'], gen_kp['face'], use_visibility=False))
+                face_pck_list.append(calculate_pck(pose_kp['face'], gen_kp['face'], face_pck_threshold, use_visibility=False))
+
+        # Calculate temporal smoothness
+        body_smoothness = calculate_temporal_smoothness([kp['body'] for kp in gen_kps])
+        hands_smoothness = calculate_temporal_smoothness(
+            [np.concatenate(kp['hands']) if kp['hands'] and len(kp['hands']) > 0 else None for kp in gen_kps]
+        )
+
+        # Compile results
+        pose_metrics = {
+            'body_mpjpe': float(np.nanmean(body_mpjpe_list)) if body_mpjpe_list else None,
+            'body_pmpjpe': float(np.nanmean(body_pmpjpe_list)) if body_pmpjpe_list else None,
+            'body_pck': float(np.nanmean(body_pck_list)) if body_pck_list else None,
+            'body_smoothness': float(body_smoothness) if not np.isnan(body_smoothness) else None,
+            'hands_mpjpe': float(np.nanmean(hands_mpjpe_list)) if hands_mpjpe_list else None,
+            'hands_pmpjpe': float(np.nanmean(hands_pmpjpe_list)) if hands_pmpjpe_list else None,
+            'hands_pck': float(np.nanmean(hands_pck_list)) if hands_pck_list else None,
+            'hands_smoothness': float(hands_smoothness) if not np.isnan(hands_smoothness) else None,
+            'face_mpjpe': float(np.nanmean(face_mpjpe_list)) if face_mpjpe_list else None,
+            'face_pmpjpe': float(np.nanmean(face_pmpjpe_list)) if face_pmpjpe_list else None,
+            'face_pck': float(np.nanmean(face_pck_list)) if face_pck_list else None,
+        }
+
+        # Calculate combined weighted score (hands: 50%, body: 30%, face: 20%)
+        weights = {'body': 0.3, 'hands': 0.5, 'face': 0.2}
+        combined_mpjpe = 0
+        combined_pmpjpe = 0
+        combined_pck = 0
+        total_weight = 0
+
+        for component in ['body', 'hands', 'face']:
+            mpjpe_key = f'{component}_mpjpe'
+            pmpjpe_key = f'{component}_pmpjpe'
+            pck_key = f'{component}_pck'
+
+            if pose_metrics.get(mpjpe_key) is not None:
+                combined_mpjpe += pose_metrics[mpjpe_key] * weights[component]
+                total_weight += weights[component]
+            if pose_metrics.get(pmpjpe_key) is not None:
+                combined_pmpjpe += pose_metrics[pmpjpe_key] * weights[component]
+            if pose_metrics.get(pck_key) is not None:
+                combined_pck += pose_metrics[pck_key] * weights[component]
+
+        pose_metrics['combined_mpjpe'] = float(combined_mpjpe / total_weight) if total_weight > 0 else None
+        pose_metrics['combined_pmpjpe'] = float(combined_pmpjpe / total_weight) if total_weight > 0 else None
+        pose_metrics['combined_pck'] = float(combined_pck / total_weight) if total_weight > 0 else None
+
+        return pose_metrics
+
+    except Exception as e:
+        logger.warning(f"Pose faithfulness calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'body_mpjpe': None,
+            'body_pmpjpe': None,
+            'body_pck': None,
+            'body_smoothness': None,
+            'hands_mpjpe': None,
+            'hands_pmpjpe': None,
+            'hands_pck': None,
+            'hands_smoothness': None,
+            'face_mpjpe': None,
+            'face_pmpjpe': None,
+            'face_pck': None,
+            'combined_mpjpe': None,
+            'combined_pmpjpe': None,
+            'combined_pck': None,
+        }
+
+
 def save_metrics_report(all_video_metrics, save_dir, global_step):
     """
     Save a comprehensive metrics report as JSON and text.
@@ -409,7 +558,13 @@ def save_metrics_report(all_video_metrics, save_dir, global_step):
     }
 
     # Compute averages for each metric
-    metric_names = ['ssim', 'psnr', 'mse', 'lpips', 'fid', 'vfid']
+    metric_names = [
+        'ssim', 'psnr', 'mse', 'lpips', 'fid', 'vfid',
+        'body_mpjpe', 'body_pmpjpe', 'body_pck', 'body_smoothness',
+        'hands_mpjpe', 'hands_pmpjpe', 'hands_pck', 'hands_smoothness',
+        'face_mpjpe', 'face_pmpjpe', 'face_pck',
+        'combined_mpjpe', 'combined_pmpjpe', 'combined_pck'
+    ]
     for metric_name in metric_names:
         values = [v[metric_name] for v in all_video_metrics if v.get(metric_name) is not None]
         if values:
@@ -436,6 +591,9 @@ def save_metrics_report(all_video_metrics, save_dir, global_step):
         f.write("-" * 80 + "\n")
 
         avg_metrics = metrics_summary['average_metrics']
+
+        # Image quality metrics
+        f.write("IMAGE QUALITY METRICS:\n")
         if avg_metrics.get('ssim') is not None:
             f.write(f"  SSIM:  {avg_metrics['ssim']:.4f}\n")
         if avg_metrics.get('psnr') is not None:
@@ -448,6 +606,43 @@ def save_metrics_report(all_video_metrics, save_dir, global_step):
             f.write(f"  FID:   {avg_metrics['fid']:.4f}\n")
         if avg_metrics.get('vfid') is not None:
             f.write(f"  VFID:  {avg_metrics['vfid']:.4f}\n")
+
+        # Pose faithfulness metrics
+        f.write("\nPOSE FAITHFULNESS METRICS:\n")
+        if avg_metrics.get('combined_mpjpe') is not None:
+            f.write(f"  Combined MPJPE:   {avg_metrics['combined_mpjpe']:.6f}\n")
+        if avg_metrics.get('combined_pmpjpe') is not None:
+            f.write(f"  Combined P-MPJPE: {avg_metrics['combined_pmpjpe']:.6f}\n")
+        if avg_metrics.get('combined_pck') is not None:
+            f.write(f"  Combined PCK:     {avg_metrics['combined_pck']:.4f} ({avg_metrics['combined_pck']*100:.2f}%)\n")
+
+        f.write("\n  Body Pose (PCK@0.15):\n")
+        if avg_metrics.get('body_mpjpe') is not None:
+            f.write(f"    MPJPE:      {avg_metrics['body_mpjpe']:.6f}\n")
+        if avg_metrics.get('body_pmpjpe') is not None:
+            f.write(f"    P-MPJPE:    {avg_metrics['body_pmpjpe']:.6f}\n")
+        if avg_metrics.get('body_pck') is not None:
+            f.write(f"    PCK:        {avg_metrics['body_pck']:.4f} ({avg_metrics['body_pck']*100:.2f}%)\n")
+        if avg_metrics.get('body_smoothness') is not None:
+            f.write(f"    Smoothness: {avg_metrics['body_smoothness']:.6f}\n")
+
+        f.write("\n  Hand Pose (PCK@0.05):\n")
+        if avg_metrics.get('hands_mpjpe') is not None:
+            f.write(f"    MPJPE:      {avg_metrics['hands_mpjpe']:.6f}\n")
+        if avg_metrics.get('hands_pmpjpe') is not None:
+            f.write(f"    P-MPJPE:    {avg_metrics['hands_pmpjpe']:.6f}\n")
+        if avg_metrics.get('hands_pck') is not None:
+            f.write(f"    PCK:        {avg_metrics['hands_pck']:.4f} ({avg_metrics['hands_pck']*100:.2f}%)\n")
+        if avg_metrics.get('hands_smoothness') is not None:
+            f.write(f"    Smoothness: {avg_metrics['hands_smoothness']:.6f}\n")
+
+        f.write("\n  Face Pose (PCK@0.05):\n")
+        if avg_metrics.get('face_mpjpe') is not None:
+            f.write(f"    MPJPE:      {avg_metrics['face_mpjpe']:.6f}\n")
+        if avg_metrics.get('face_pmpjpe') is not None:
+            f.write(f"    P-MPJPE:    {avg_metrics['face_pmpjpe']:.6f}\n")
+        if avg_metrics.get('face_pck') is not None:
+            f.write(f"    PCK:        {avg_metrics['face_pck']:.4f} ({avg_metrics['face_pck']*100:.2f}%)\n")
 
         f.write("\n" + "-" * 80 + "\n")
         f.write("PER-VIDEO METRICS\n")
@@ -1120,6 +1315,43 @@ def parse_args():
             "the training stage"
         ),
     )
+    parser.add_argument(
+        "--control_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "The ControlNet guidance scale."
+        ),
+    )
+    parser.add_argument(
+        "--learnable_control_scale",
+        action="store_true",
+        help=(
+            "Make the control scale a learnable parameter."
+        ),
+    )
+    parser.add_argument(
+        "--use_double_injection",
+        action="store_true",
+        help=(
+            "Enable injection at two downsample blocks (after first and second) instead of just one."
+        ),
+    )
+    parser.add_argument(
+        "--use_attention_injection",
+        action="store_true",
+        help=(
+            "Enable the noise features to cross-attend to the control features at the injection points."
+        ),
+    )
+    parser.add_argument(
+        "--use_interleaved_injection",
+        action="store_true",
+        help=(
+            "Enable checkerboard interleaving of noise and control features at the injection points."
+        ),
+    )
+
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1232,7 +1464,10 @@ def main():
     )
     
     logger.info("Initializing controlnext weights from unet")
-    controlnext = ControlNeXtSDVModel()
+    controlnext = ControlNeXtSDVModel(
+        scale=args.control_scale,
+        learnable_scale=args.learnable_control_scale
+    )
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
@@ -1312,9 +1547,15 @@ def main():
     controlnext.requires_grad_(True)
     parameters_list = []
 
+    # Group ControlNeXt parameters together instead of individually
+    # This avoids DeepSpeed partitioning issues with very small tensors (like scale_param)
+    controlnext_params = []
     for name, para in controlnext.named_parameters():
         para.requires_grad = True
-        parameters_list.append({"params": para, "lr": args.learning_rate } )
+        controlnext_params.append(para)
+
+    if controlnext_params:
+        parameters_list.append({"params": controlnext_params, "lr": args.learning_rate})
 
     """
     For more details, please refer to: https://github.com/dvlab-research/ControlNeXt/issues/14#issuecomment-2290450333
@@ -1323,15 +1564,20 @@ def main():
     To achieve optimal performance, it's necessary to first continue training SVD and SD3 on human-related data to develop a robust backbone before fine-tuning. Of course, you can also combine the continual pretraining and finetuning. So you can find that we direct provide the full SVD parameters.
     We have experimented with two approaches: 1.Directly training the model from scratch on human dancing data. 2. Continual training using a pre-trained human generation backbone, followed by fine-tuning a selective small subset of parameters. Interestingly, we observed no significant difference in performance between these two methods.
     """
+    # Group UNet parameters together as well
+    unet_params = []
     for name, para in unet.named_parameters():
         ## For Finetuning of selective parameters
         #if 'to_out' in name or 'to_v' in name:
         ## For Pretraining
         if 'to_out' in name or 'to_v' in name:
             para.requires_grad = True
-            parameters_list.append({"params": para})
+            unet_params.append(para)
         else:
             para.requires_grad = False
+
+    if unet_params:
+        parameters_list.append({"params": unet_params})
 
     # Create optimizer with parameter list
     optimizer = optimizer_cls(
@@ -1365,10 +1611,11 @@ def main():
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
 
     train_dataset = make_train_dataset(args)
-    sampler = RandomSampler(train_dataset)
+    # Don't use explicit sampler - let Accelerate handle distributed sampling
+    # Using RandomSampler causes ranks to go out of sync in distributed training
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        sampler=sampler,
+        shuffle=True,  # Accelerate will convert this to DistributedSampler automatically
         batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
     )
@@ -1601,7 +1848,11 @@ def main():
                     controlnext_image = batch["guide_values"].to(
                         dtype=weight_dtype, device=accelerator.device, non_blocking=True
                     )
-                    controlnext_output = controlnext(controlnext_image, timesteps)
+                    # Only pass scale explicitly if not using learnable scale
+                    if args.learnable_control_scale:
+                        controlnext_output = controlnext(controlnext_image, timesteps)
+                    else:
+                        controlnext_output = controlnext(controlnext_image, timesteps, scale=args.control_scale)
                     
 
                     inp_noisy_latents = torch.cat(
@@ -1613,6 +1864,9 @@ def main():
                         inp_noisy_latents, timesteps, encoder_hidden_states,
                         added_time_ids=added_time_ids,
                         conditional_controls=controlnext_output,
+                        # use_double_injection=args.use_double_injection,
+                        use_attention_injection=args.use_attention_injection,
+                        use_interleaved_injection=args.use_interleaved_injection,
                         ).sample
                     
 
@@ -1754,12 +2008,15 @@ def main():
                                     decode_chunk_size=4,
                                     motion_bucket_id=127.,
                                     fps=7,
-                                    controlnext_cond_scale=1.0,
+                                    controlnext_cond_scale=args.control_scale,
                                     min_guidance_scale=3,
                                     max_guidance_scale=3,
                                     noise_aug_strength=0.02,
                                     num_inference_steps=25,
                                     overlap=4,
+                                    use_double_injection=args.use_double_injection,
+                                    use_attention_injection=args.use_attention_injection,
+                                    use_interleaved_injection=args.use_interleaved_injection,
                                 ).frames
                                 save_dir = os.path.join(val_save_dir, f"validation_{global_step}_vids")
                                 os.makedirs(save_dir, exist_ok=True)
@@ -1777,24 +2034,43 @@ def main():
                                     # Flatten generated frames (video_frames is list of lists)
                                     generated_frames_flat = [img for sublist in video_frames for img in sublist]
 
-                                    # Compute metrics
+                                    # Compute image quality metrics
                                     video_metrics = compute_video_metrics(
                                         generated_frames_flat,
                                         val_gt_frames,
                                         device=accelerator.device
                                     )
+
+                                    # Compute pose faithfulness metrics
+                                    logger.info(f"Computing pose faithfulness for video {i} ({basename})")
+                                    pose_metrics = compute_pose_faithfulness_metrics(
+                                        val_control_frames,
+                                        generated_frames_flat
+                                        # Uses default thresholds: body_pck_threshold=0.15, hands/face=0.05
+                                    )
+
+                                    # Merge metrics
+                                    video_metrics.update(pose_metrics)
                                     video_metrics['video_index'] = i
                                     video_metrics['basename'] = basename
                                     all_video_metrics.append(video_metrics)
 
                                     # Log metrics for this video
-                                    logger.info(f"Video {i} metrics:")
+                                    logger.info(f"Video {i} image quality metrics:")
                                     if video_metrics.get('ssim') is not None:
                                         logger.info(f"  SSIM: {video_metrics['ssim']:.4f}")
                                     if video_metrics.get('psnr') is not None:
                                         logger.info(f"  PSNR: {video_metrics['psnr']:.2f} dB")
                                     if video_metrics.get('lpips') is not None:
                                         logger.info(f"  LPIPS: {video_metrics['lpips']:.4f}")
+
+                                    logger.info(f"Video {i} pose faithfulness metrics:")
+                                    if video_metrics.get('combined_pck') is not None:
+                                        logger.info(f"  Combined PCK: {video_metrics['combined_pck']:.4f} ({video_metrics['combined_pck']*100:.2f}%)")
+                                    if video_metrics.get('hands_pck') is not None:
+                                        logger.info(f"  Hands PCK: {video_metrics['hands_pck']:.4f} ({video_metrics['hands_pck']*100:.2f}%)")
+                                    if video_metrics.get('body_pck') is not None:
+                                        logger.info(f"  Body PCK: {video_metrics['body_pck']:.4f} ({video_metrics['body_pck']*100:.2f}%)")
                                 else:
                                     logger.warning(f"No ground truth available for video {i} ({basename}), skipping metrics")
 
@@ -1813,10 +2089,23 @@ def main():
                             logger.info(f"VALIDATION SUMMARY - Step {global_step}")
                             logger.info("=" * 80)
                             logger.info(f"Evaluated {len(all_video_metrics)} videos")
-                            logger.info("Average metrics:")
-                            for metric_name, value in avg_metrics.items():
+
+                            logger.info("\nAverage Image Quality Metrics:")
+                            for metric_name in ['ssim', 'psnr', 'mse', 'lpips', 'fid', 'vfid']:
+                                value = avg_metrics.get(metric_name)
                                 if value is not None:
                                     logger.info(f"  {metric_name.upper()}: {value:.4f}")
+
+                            logger.info("\nAverage Pose Faithfulness Metrics:")
+                            if avg_metrics.get('combined_pck') is not None:
+                                logger.info(f"  Combined PCK: {avg_metrics['combined_pck']:.4f} ({avg_metrics['combined_pck']*100:.2f}%)")
+                            if avg_metrics.get('combined_mpjpe') is not None:
+                                logger.info(f"  Combined MPJPE: {avg_metrics['combined_mpjpe']:.6f}")
+                            if avg_metrics.get('hands_pck') is not None:
+                                logger.info(f"  Hands PCK: {avg_metrics['hands_pck']:.4f} ({avg_metrics['hands_pck']*100:.2f}%)")
+                            if avg_metrics.get('body_pck') is not None:
+                                logger.info(f"  Body PCK: {avg_metrics['body_pck']:.4f} ({avg_metrics['body_pck']*100:.2f}%)")
+
                             logger.info("=" * 80)
                         else:
                             logger.warning("No ground truth videos available - metrics not computed")        

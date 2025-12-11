@@ -23,3 +23,7 @@ VDM_EVFI/**/checkpoints*
 latest
 
 **/zero_to_fp32.py
+
+**.e*
+**.o*
+**/__pycache__/

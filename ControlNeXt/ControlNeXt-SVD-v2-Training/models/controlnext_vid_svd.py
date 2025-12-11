@@ -18,7 +18,9 @@ class ControlNeXtSDVModel(ModelMixin, ConfigMixin):
         time_embed_dim = 256,
         in_channels = [128, 128],
         out_channels = [128, 256],
-        groups = [4, 8]
+        groups = [4, 8],
+        scale = 1.0,
+        learnable_scale = False,
     ):
         super().__init__()
 
@@ -56,7 +58,7 @@ class ControlNeXtSDVModel(ModelMixin, ConfigMixin):
                     name="op",
                 )
             )
-        
+
         self.mid_convs = nn.ModuleList()
         self.mid_convs.append(nn.Sequential(
             nn.Conv2d(
@@ -85,7 +87,16 @@ class ControlNeXtSDVModel(ModelMixin, ConfigMixin):
             stride=1,
         ))
 
-        self.scale = 1. 
+        # Initialize scale as either a learnable parameter or a fixed value
+        self.learnable_scale = learnable_scale
+        if learnable_scale:
+            # Make scale a learnable parameter (use 1D tensor for DeepSpeed compatibility)
+            # Note: Using [scale] instead of scale to create a 1D tensor, avoiding issues with
+            # DeepSpeed's gradient partitioning which can have trouble with scalar tensors
+            self.scale_param = nn.Parameter(torch.tensor([scale], dtype=torch.float32))
+        else:
+            # Keep scale as a simple float (saved via @register_to_config)
+            self.scale_param = None
 
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
@@ -125,8 +136,9 @@ class ControlNeXtSDVModel(ModelMixin, ConfigMixin):
         self,
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
+        scale: Optional[float] = None,
     ):
-        
+
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
@@ -155,6 +167,7 @@ class ControlNeXtSDVModel(ModelMixin, ConfigMixin):
 
         # Flatten the batch and frames dimensions
         # sample: [batch, frames, channels, height, width] -> [batch * frames, channels, height, width]
+        # print(F"Before flattening, sample shape in ControlNeXt: {sample.shape}")
         sample = sample.flatten(0, 1)
         # Repeat the embeddings num_video_frames times
         # emb: [batch, channels] -> [batch * frames, channels]
@@ -165,12 +178,22 @@ class ControlNeXtSDVModel(ModelMixin, ConfigMixin):
         for res, downsample in zip(self.down_res, self.down_sample):
             sample = res(sample, emb)
             sample = downsample(sample, emb)
-        
+
         sample = self.mid_convs[0](sample) + sample
         sample = self.mid_convs[1](sample)
 
+        # Use passed scale if provided, otherwise use model's scale parameter
+        if scale is not None:
+            effective_scale = scale
+        elif self.scale_param is not None:
+            # Use learnable parameter if it exists (extract scalar from 1D tensor)
+            effective_scale = self.scale_param[0]
+        else:
+            # Fall back to config scale value
+            effective_scale = self.scale
+
         return {
             'output': sample,
-            'scale': self.scale,
+            'scale': effective_scale,
         }
     

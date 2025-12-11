@@ -247,6 +247,11 @@ class UNetSpatioTemporalConditionControlNeXtModel(ModelMixin, ConfigMixin, UNet2
             padding=1,
         )
 
+        # Cross-attention modules for control injection (lazily initialized)
+        # These are None initially to allow loading checkpoints without these parameters
+        self.control_cross_attention_block0 = None
+        self.control_cross_attention_block1 = None
+
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
         r"""
@@ -367,6 +372,9 @@ class UNetSpatioTemporalConditionControlNeXtModel(ModelMixin, ConfigMixin, UNet2
         return_dict: bool = True,
         added_time_ids: torch.Tensor=None,
         image_only_indicator: torch.Tensor=None,
+        use_double_injection: bool = False,
+        use_attention_injection: bool = False,
+        use_interleaved_injection: bool = False,
     ) -> Union[UNetSpatioTemporalConditionOutput, Tuple]:
         r"""
         The [`UNetSpatioTemporalConditionModel`] forward method.
@@ -423,6 +431,7 @@ class UNetSpatioTemporalConditionControlNeXtModel(ModelMixin, ConfigMixin, UNet2
 
         # Flatten the batch and frames dimensions
         # sample: [batch, frames, channels, height, width] -> [batch * frames, channels, height, width]
+        # print(f"Input sample shape: {sample.shape}")
         sample = sample.flatten(0, 1)
         # Repeat the embeddings num_video_frames times
         # emb: [batch, channels] -> [batch * frames, channels]
@@ -436,6 +445,10 @@ class UNetSpatioTemporalConditionControlNeXtModel(ModelMixin, ConfigMixin, UNet2
             image_only_indicator = torch.zeros(batch_size, num_frames, dtype=sample.dtype, device=sample.device)
 
         down_block_res_samples = (sample,)
+        # Store the conditioning scale and output when first encountered
+        control_scale = None
+        control_output = None
+
         for idx,downsample_block in enumerate(self.down_blocks):
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                 sample, res_samples = downsample_block(
@@ -453,15 +466,96 @@ class UNetSpatioTemporalConditionControlNeXtModel(ModelMixin, ConfigMixin, UNet2
 
             down_block_res_samples += res_samples
 
+            # Extract control parameters on first injection
             if idx == 0 and conditional_controls is not None:
-                scale = conditional_controls['scale']
-                conditional_controls = conditional_controls['output']
+                control_scale = conditional_controls['scale']
+                control_output = conditional_controls['output']
+
+            # THIS IS WHERE WE INJECT THE CONTROLNET FEATURES
+            # Inject after first downsample block (idx=0) and optionally after second (idx=1)
+            inject_at_this_block = (idx == 0) or (idx == 1 and use_double_injection)
+
+            if inject_at_this_block and conditional_controls is not None:
+                # print(f"Injecting at block {idx}: double_injection={use_double_injection}, attention_injection={use_attention_injection}, interleaved={use_interleaved_injection}")
+                # Use the stored control parameters
+                # print(F"Size of conditional_controls before resizing: {control_output.shape}")
                 mean_latents, std_latents = torch.mean(sample, dim=(1, 2, 3), keepdim=True), torch.std(sample, dim=(1, 2, 3), keepdim=True)
-                mean_control, std_control = torch.mean(conditional_controls, dim=(1, 2, 3), keepdim=True), torch.std(conditional_controls, dim=(1, 2, 3), keepdim=True)
-                conditional_controls = (conditional_controls - mean_control) * (std_latents / (std_control + 1e-5)) + mean_latents
-                conditional_controls = F.adaptive_avg_pool2d(conditional_controls, sample.shape[-2:])
-                #  0.2: This superparameter is used to adjust the control level: increasing this value will strengthen the control level.
-                sample = sample + conditional_controls * scale * 0.2
+                mean_control, std_control = torch.mean(control_output, dim=(1, 2, 3), keepdim=True), torch.std(control_output, dim=(1, 2, 3), keepdim=True)
+                normalized_control = (control_output - mean_control) * (std_latents / (std_control + 1e-5)) + mean_latents
+
+                # Resize spatially to match sample dimensions
+                resized_control = F.adaptive_avg_pool2d(normalized_control, sample.shape[-2:])
+
+                # Adapt channel dimension if needed (for second downsample block)
+                if resized_control.shape[1] != sample.shape[1]:
+                    # Repeat channels to match target dimension (simple but effective)
+                    channel_repeat_factor = sample.shape[1] // resized_control.shape[1]
+                    if sample.shape[1] % resized_control.shape[1] == 0:
+                        # Exact multiple: repeat channels
+                        resized_control = resized_control.repeat(1, channel_repeat_factor, 1, 1)
+                    else:
+                        # Not exact multiple: repeat and truncate
+                        resized_control = resized_control.repeat(1, channel_repeat_factor + 1, 1, 1)
+                        resized_control = resized_control[:, :sample.shape[1], :, :]
+
+                if use_attention_injection:
+                    b, c, h, w = sample.shape
+
+                    seq_len = h * w
+                    sample_reshaped = sample.view(b, c, seq_len).permute(0, 2, 1)  # (b, seq_len, c)
+                    control_reshaped = resized_control.view(b, c, seq_len).permute(0, 2, 1)  # (b, seq_len, c)
+
+                    # Get or create the appropriate attention module (lazy initialization)
+                    attn_module = self.control_cross_attention_block0 if idx == 0 else self.control_cross_attention_block1
+
+                    if attn_module is None:
+                        embed_dim = c
+                        # Determine number of heads based on channel divisibility
+                        num_heads = 8 if c % 8 == 0 else (4 if c % 4 == 0 else 1)
+
+                        attn_module = nn.MultiheadAttention(
+                            embed_dim=embed_dim,
+                            num_heads=num_heads,
+                            batch_first=True
+                        ).to(sample.device).to(sample.dtype)
+
+                        # Register the module so it's trainable and saved with checkpoints
+                        if idx == 0:
+                            self.control_cross_attention_block0 = attn_module
+                        else:
+                            self.control_cross_attention_block1 = attn_module
+
+                        print(f"[Block {idx}] Initialized learnable cross-attention: {num_heads} heads, embed_dim={embed_dim}")
+
+                    output, _ = attn_module(
+                        query=sample_reshaped,
+                        key=control_reshaped,
+                        value=control_reshaped,
+                    )
+
+                    final_output_map = output.permute(0, 2, 1).view(b, c, h, w)
+                    sample = sample + final_output_map * control_scale * 0.2
+                    print(f"[Block {idx}] Applied cross-attention injection with scale {control_scale}")
+
+                elif use_interleaved_injection:
+                    # Checkerboard interleaving of noise and control features
+                    b, c, h, w = sample.shape
+
+                    # Create checkerboard mask: True for noise pixels, False for control pixels
+                    # Pattern: alternating pixels in a checkerboard pattern
+                    mask = torch.zeros((b, c, h, w), dtype=torch.bool, device=sample.device)
+                    mask[:, :, 0::2, 0::2] = True  # Even rows, even cols = noise
+                    mask[:, :, 1::2, 1::2] = True  # Odd rows, odd cols = noise
+                    # Odd rows, even cols and even rows, odd cols = control
+
+                    # Apply checkerboard interleaving
+                    control_contribution = resized_control * control_scale * 0.2
+                    sample = torch.where(mask, sample, sample + control_contribution)
+                    print(f"Applied checkerboard interleaving at block {idx}")
+
+                else:
+                    #  0.2: This superparameter is used to adjust the control level: increasing this value will strengthen the control level.
+                    sample = sample + resized_control * control_scale * 0.2
 
         if down_block_additional_residuals is not None:
             new_down_block_res_samples = ()

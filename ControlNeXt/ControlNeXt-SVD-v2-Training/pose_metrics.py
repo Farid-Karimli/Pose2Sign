@@ -36,8 +36,8 @@ class PoseExtractor:
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.3,  # Lowered from 0.5 to catch more hands
+            min_tracking_confidence=0.3     # Lowered from 0.5 to catch more hands
         )
 
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -95,13 +95,16 @@ class PoseExtractor:
 
         return keypoints
 
-    def extract_from_video(self, video_path: str, verbose: bool = True) -> List[Dict]:
+    def extract_from_video(self, video_path: str, verbose: bool = True,
+                           sample_timestamps: Optional[List[float]] = None) -> List[Dict]:
         """
         Extract pose keypoints from all frames in a video.
 
         Args:
             video_path: Path to video file
             verbose: Show progress bar
+            sample_timestamps: If provided, extract frames at these specific timestamps (in seconds)
+                             instead of extracting all frames sequentially
 
         Returns:
             List of keypoint dictionaries, one per frame
@@ -110,18 +113,38 @@ class PoseExtractor:
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
 
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
         all_keypoints = []
 
-        iterator = tqdm(range(frame_count), desc="Extracting poses") if verbose else range(frame_count)
+        if sample_timestamps is not None:
+            # Extract frames at specific timestamps
+            iterator = tqdm(sample_timestamps, desc="Extracting poses") if verbose else sample_timestamps
 
-        for _ in iterator:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            for timestamp in iterator:
+                # Seek to the frame at this timestamp
+                frame_idx = int(timestamp * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
 
-            keypoints = self.extract_from_frame(frame)
-            all_keypoints.append(keypoints)
+                ret, frame = cap.read()
+                if not ret:
+                    # If we can't read the frame, append None or use last valid keypoints
+                    all_keypoints.append({'body': None, 'hands': None, 'face': None})
+                    continue
+
+                keypoints = self.extract_from_frame(frame)
+                all_keypoints.append(keypoints)
+        else:
+            # Extract all frames sequentially (original behavior)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            iterator = tqdm(range(frame_count), desc="Extracting poses") if verbose else range(frame_count)
+
+            for _ in iterator:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                keypoints = self.extract_from_frame(frame)
+                all_keypoints.append(keypoints)
 
         cap.release()
         return all_keypoints
@@ -155,16 +178,101 @@ def calculate_mpjpe(kp1: np.ndarray, kp2: np.ndarray, use_visibility: bool = Tru
     coords1 = kp1[:, :3]
     coords2 = kp2[:, :3]
 
-    # Calculate Euclidean distance per joint
-    distances = np.sqrt(np.sum((coords1 - coords2) ** 2, axis=1))
-
-    # Apply visibility mask if available
+    # Apply visibility mask if available (use ground truth visibility)
     if use_visibility and kp1.shape[1] == 4:
         visibility = kp1[:, 3]
         # Only count joints with visibility > 0.5
         mask = visibility > 0.5
-        if mask.sum() > 0:
-            distances = distances[mask]
+        if mask.sum() == 0:
+            return np.nan
+        coords1 = coords1[mask]
+        coords2 = coords2[mask]
+
+    # Calculate Euclidean distance per joint
+    distances = np.sqrt(np.sum((coords1 - coords2) ** 2, axis=1))
+
+    return np.mean(distances)
+
+
+def procrustes_align(kp_source: np.ndarray, kp_target: np.ndarray) -> np.ndarray:
+    """
+    Align source keypoints to target using Procrustes analysis (rotation, translation, scale).
+
+    Args:
+        kp_source: Source keypoints to align (N, 3)
+        kp_target: Target keypoints (N, 3)
+
+    Returns:
+        Aligned source keypoints (N, 3)
+    """
+    # Center both point sets
+    source_centered = kp_source - kp_source.mean(axis=0)
+    target_centered = kp_target - kp_target.mean(axis=0)
+
+    # Calculate scale
+    source_scale = np.sqrt(np.sum(source_centered ** 2))
+    target_scale = np.sqrt(np.sum(target_centered ** 2))
+
+    if source_scale == 0 or target_scale == 0:
+        return kp_source
+
+    # Normalize
+    source_normalized = source_centered / source_scale
+    target_normalized = target_centered / target_scale
+
+    # Find rotation using SVD
+    H = source_normalized.T @ target_normalized
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Ensure proper rotation (det(R) = 1)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    # Apply transformation: scale, rotate, translate
+    aligned = (source_normalized @ R) * target_scale + kp_target.mean(axis=0)
+
+    return aligned
+
+
+def calculate_procrustes_mpjpe(kp1: np.ndarray, kp2: np.ndarray, use_visibility: bool = True) -> float:
+    """
+    Calculate MPJPE after Procrustes alignment (P-MPJPE).
+    This removes scale, rotation, and translation differences.
+
+    Args:
+        kp1, kp2: Keypoint arrays of shape (N, 3) or (N, 4) if visibility included
+        use_visibility: If True and visibility data available, only count visible joints
+
+    Returns:
+        P-MPJPE value (lower is better)
+    """
+    if kp1 is None or kp2 is None:
+        return np.nan
+
+    # Handle different shapes
+    if kp1.shape != kp2.shape:
+        return np.nan
+
+    # Extract x, y, z coordinates
+    coords1 = kp1[:, :3]
+    coords2 = kp2[:, :3]
+
+    # Apply visibility mask if available (use ground truth visibility)
+    if use_visibility and kp1.shape[1] == 4:
+        visibility = kp1[:, 3]
+        mask = visibility > 0.5
+        if mask.sum() == 0:
+            return np.nan
+        coords1 = coords1[mask]
+        coords2 = coords2[mask]
+
+    # Align coords2 to coords1 using Procrustes
+    coords2_aligned = procrustes_align(coords2, coords1)
+
+    # Calculate Euclidean distance per joint
+    distances = np.sqrt(np.sum((coords1 - coords2_aligned) ** 2, axis=1))
 
     return np.mean(distances)
 
@@ -195,7 +303,7 @@ def calculate_pck(kp1: np.ndarray, kp2: np.ndarray, threshold: float = 0.05,
     # Calculate Euclidean distance per joint
     distances = np.sqrt(np.sum((coords1 - coords2) ** 2, axis=1))
 
-    # Apply visibility mask if available
+    # Apply visibility mask if available (use ground truth visibility from kp1)
     if use_visibility and kp1.shape[1] == 4:
         visibility = kp1[:, 3]
         mask = visibility > 0.5
@@ -280,7 +388,8 @@ def evaluate_pose_faithfulness(
     generated_video_path: str,
     pck_threshold: float = 0.05,
     verbose: bool = True,
-    save_results: Optional[str] = None
+    save_results: Optional[str] = None,
+    align_fps: bool = True
 ) -> Dict:
     """
     Evaluate pose faithfulness between pose conditioning video and generated video.
@@ -291,29 +400,88 @@ def evaluate_pose_faithfulness(
         pck_threshold: Threshold for PCK metric (normalized coordinates)
         verbose: Print detailed results
         save_results: Path to save results JSON (optional)
+        align_fps: If True, align videos temporally by sampling at matching timestamps.
+                   If False, use naive frame-by-frame comparison (old behavior).
 
     Returns:
         Dictionary containing all metrics
     """
     extractor = PoseExtractor()
 
-    # Extract keypoints from both videos
-    if verbose:
-        print(f"Extracting poses from input video: {pose_video_path}")
-    pose_kps = extractor.extract_from_video(pose_video_path, verbose=verbose)
+    # Get video metadata
+    cap_pose = cv2.VideoCapture(pose_video_path)
+    cap_gen = cv2.VideoCapture(generated_video_path)
+
+    if not cap_pose.isOpened() or not cap_gen.isOpened():
+        raise ValueError("Cannot open one or both videos")
+
+    pose_fps = cap_pose.get(cv2.CAP_PROP_FPS)
+    gen_fps = cap_gen.get(cv2.CAP_PROP_FPS)
+    pose_frame_count = int(cap_pose.get(cv2.CAP_PROP_FRAME_COUNT))
+    gen_frame_count = int(cap_gen.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    pose_duration = pose_frame_count / pose_fps if pose_fps > 0 else 0
+    gen_duration = gen_frame_count / gen_fps if gen_fps > 0 else 0
+
+    cap_pose.release()
+    cap_gen.release()
 
     if verbose:
-        print(f"Extracting poses from generated video: {generated_video_path}")
-    gen_kps = extractor.extract_from_video(generated_video_path, verbose=verbose)
+        print(f"\nVideo metadata:")
+        print(f"  Pose video: {pose_frame_count} frames @ {pose_fps:.2f} FPS ({pose_duration:.2f}s)")
+        print(f"  Generated video: {gen_frame_count} frames @ {gen_fps:.2f} FPS ({gen_duration:.2f}s)")
+
+    # Determine sampling strategy
+    if align_fps and (pose_fps != gen_fps or pose_frame_count != gen_frame_count):
+        if verbose:
+            print(f"\nFPS/frame count mismatch detected. Using temporal alignment...")
+
+        # Use the shorter duration and lower frame count to determine sampling
+        min_duration = min(pose_duration, gen_duration)
+        # Sample at the POSE (GT) FPS to get better temporal coverage
+        # This ensures we sample more frames and are more likely to catch hands
+        sample_fps = pose_fps  # Changed from min(pose_fps, gen_fps)
+        num_samples = int(min_duration * sample_fps)
+
+        # Generate timestamps for sampling (evenly spaced)
+        sample_timestamps = [i / sample_fps for i in range(num_samples)]
+
+        if verbose:
+            print(f"  Sampling {num_samples} frames at {sample_fps:.2f} FPS over {min_duration:.2f}s")
+            print(f"  Timestamp range: {sample_timestamps[0]:.3f}s to {sample_timestamps[-1]:.3f}s")
+
+        # Extract keypoints from both videos at matching timestamps
+        if verbose:
+            print(f"\nExtracting poses from input video at aligned timestamps: {pose_video_path}")
+        pose_kps = extractor.extract_from_video(pose_video_path, verbose=verbose,
+                                                sample_timestamps=sample_timestamps)
+
+        if verbose:
+            print(f"Extracting poses from generated video at aligned timestamps: {generated_video_path}")
+        gen_kps = extractor.extract_from_video(generated_video_path, verbose=verbose,
+                                               sample_timestamps=sample_timestamps)
+    else:
+        # Original behavior: extract all frames and truncate
+        if verbose:
+            print(f"\nExtracting poses from input video: {pose_video_path}")
+        pose_kps = extractor.extract_from_video(pose_video_path, verbose=verbose)
+
+        if verbose:
+            print(f"Extracting poses from generated video: {generated_video_path}")
+        gen_kps = extractor.extract_from_video(generated_video_path, verbose=verbose)
+
+        # Align frame counts
+        min_frames = min(len(pose_kps), len(gen_kps))
+        if len(pose_kps) != len(gen_kps):
+            if verbose:
+                print(f"Warning: Frame count mismatch. Using first {min_frames} frames.")
+            pose_kps = pose_kps[:min_frames]
+            gen_kps = gen_kps[:min_frames]
 
     extractor.close()
 
-    # Align frame counts
-    min_frames = min(len(pose_kps), len(gen_kps))
-    if len(pose_kps) != len(gen_kps):
-        print(f"Warning: Frame count mismatch. Using first {min_frames} frames.")
-        pose_kps = pose_kps[:min_frames]
-        gen_kps = gen_kps[:min_frames]
+    # Get actual number of frames being compared
+    num_frames = min(len(pose_kps), len(gen_kps))
 
     # Calculate frame-wise metrics
     body_mpjpe_list = []
@@ -349,7 +517,7 @@ def evaluate_pose_faithfulness(
     # Compile results
     results = {
         'overall': {
-            'num_frames': min_frames,
+            'num_frames': num_frames,
             'body_detected_frames': len(body_mpjpe_list),
             'hands_detected_frames': len(hands_mpjpe_list),
             'face_detected_frames': len(face_mpjpe_list),

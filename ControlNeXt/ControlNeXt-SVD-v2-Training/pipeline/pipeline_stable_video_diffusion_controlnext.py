@@ -355,6 +355,9 @@ class StableVideoDiffusionPipelineControlNeXt(DiffusionPipeline):
         batch_size=1,
         overlap=5,
         frames_per_batch = 14,
+        use_double_injection: bool = False,
+        use_attention_injection: bool = False,
+        use_interleaved_injection: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -572,6 +575,7 @@ class StableVideoDiffusionPipelineControlNeXt(DiffusionPipeline):
                     controlnext_output = self.controlnext(
                         controlnext_condition,
                         t,
+                        scale=controlnext_cond_scale,
                     )
                     if do_classifier_free_guidance:
                         N = controlnext_output['output'].shape[0]
@@ -590,6 +594,9 @@ class StableVideoDiffusionPipelineControlNeXt(DiffusionPipeline):
                         encoder_hidden_states=image_embeddings,
                         added_time_ids=added_time_ids,
                         conditional_controls=controlnext_output,
+                        use_double_injection=use_double_injection,
+                        use_attention_injection=use_attention_injection,
+                        use_interleaved_injection=use_interleaved_injection,
                         return_dict=False,
                     )[0]
 

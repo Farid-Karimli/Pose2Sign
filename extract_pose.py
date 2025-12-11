@@ -117,18 +117,20 @@ def extract_pose_video(input_path, output_path, draw_on_blank=True, display_prog
 
 
 if __name__ == "__main__":
-    asl_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/asl"
+    asl_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/test/asl"
     asl_video_files = os.listdir(asl_video_path)
 
-    pose_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/training/pose"
+    pose_video_path = "/restricted/projectnb/cs599dg/Pose2Sign/ASL_Citizen/test/pose"
     
-    SUBSET = 1000
+    SUBSET = None
 
     if SUBSET:
         asl_video_files = asl_video_files[SUBSET:SUBSET+30]
 
+    print(F"ASL video files to process: {asl_video_files}")
     for video_file in tqdm(asl_video_files, desc="Processing videos...", unit="video"):
         input_video = os.path.join(asl_video_path, video_file)
         output_video = os.path.join(pose_video_path, video_file)
 
         extract_pose_video(input_video, output_video, draw_on_blank=True, display_progress=False)
+
