@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DiT vs. UNet - Motion Synthesis</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@300;400;600;700&display=swap');
+
+        :root {
+            --primary-color: #2563eb;
+            --bg-color: #f8fafc;
+            --text-color: #1e293b;
+            --nav-bg: #ffffff;
+            --card-bg: #ffffff;
+            --border-color: #e2e8f0;
+        }
+
+        body {
+            font-family: 'Nunito Sans', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+            line-height: 1.6;
+        }
+
+        /* Nav Bar */
+        nav {
+            background: var(--nav-bg);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .nav-brand {
+            font-weight: 800;
+            font-size: 1.5rem;
+            color: var(--text-color);
+            text-decoration: none;
+            letter-spacing: -0.025em;
+        }
+
+        .nav-links {
+            display: flex;
+            justify-content: space-around;
+            gap: 2rem;
+        }
+
+        .nav-links a {
+            text-decoration: none;
+            color: #64748b;
+            font-weight: 600;
+            transition: color 0.2s;
+            font-size: 0.95rem;
+        }
+
+        .nav-links a:hover {
+            color: var(--primary-color);
+        }
+
+        .nav-links a.active {
+            color: var(--primary-color);
+        }
+
+        /* Main Content */
+        main {
+            max-width: 1100px;
+            margin: 3rem auto;
+            padding: 0 1.5rem;
+        }
+
+        .header-section {
+            text-align: center;
+            margin-bottom: 3rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 1.5rem;
+            line-height: 1.2;
+            color: #0f172a;
+            max-width: 900px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .abstract-container {
+            max-width: 800px;
+            margin: 0 auto;
+            text-align: left;
+            background: #fff;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            border: 1px solid var(--border-color);
+        }
+
+        .abstract-content {
+            color: #475569;
+            font-size: 1.05rem;
+        }
+
+        .abstract-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #0f172a;
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 0.05em;
+        }
+
+        /* Video Section */
+        .comparison-section {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+            margin-top: 4rem;
+        }
+
+        @media (min-width: 768px) {
+            .comparison-section {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
+        .video-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            border: 1px solid var(--border-color);
+            transition: transform 0.2s;
+        }
+
+        .video-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .video-label {
+            padding: 1rem 1.5rem;
+            font-weight: 700;
+            color: #1e293b;
+            background: #fff;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-weight: 600;
+        }
+
+        .badge-default {
+            background-color: #f1f5f9;
+            color: #64748b;
+        }
+
+        .badge-primary {
+            background-color: #dbeafe;
+            color: #2563eb;
+        }
+
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            background: #000;
+            line-height: 0;
+        }
+
+        video {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        footer {
+            margin-top: 5rem;
+            text-align: center;
+            padding: 2rem;
+            color: #94a3b8;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+
+<body>
+
+    <nav>
+        <div class="nav-links">
+            <a href="index.html" class="active">Home</a>
+            <a href="./demo.html">Demos</a>
+            <a href="#" class="paper-link">Read Paper</a>
+        </div>
+    </nav>
+
+    <main>
+        <div class="header-section">
+            <h1>DiT vs. UNet: Evaluating Control Injection Methods for Fine-Grained Motion Synthesis</h1>
+
+            <div class="abstract-container">
+                <span class="abstract-label">Abstract</span>
+                <div class="abstract-content">
+                    Video generation models can synthesize realistic scenes and human motion from images and text, but
+                    they often lack precise control over fine-grained details. Conditional video generation methods
+                    address this by grounding the synthesis on structured inputs such as sketches or pose sequences,
+                    enabling models to follow specific motion trajectories. However, existing approaches primarily focus
+                    on coarse body movement and struggle to reconstruct subtle hand and facial motions. We evaluate two
+                    pose-conditioned video generation models on sign language and find that while both replicate the
+                    overall arm movement, they fail to preserve accurate finger articulation and interaction. To improve
+                    fine-grained fidelity, we isolate the conditioning mechanism and study how pose feature propogate
+                    through different architectures. Our results show that distributing conditioning features deeper
+                    into DiT blocks improves the reconstruction of detailed hand and facial motion.
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <footer>
+        &copy; 2024 Farid Karimli, Onur Okuducu & Deepti Ghadiyaram. All rights reserved.
+    </footer>
+
+</body>
+
+</html>
